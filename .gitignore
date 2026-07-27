@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+*.sqlite3
+db.sqlite3
+/backend/staticfiles/
+.DS_Store
+
+# กันเผื่อ subproject ใหม่ในอนาคตลืมสร้าง .gitignore ของตัวเอง (frontend/print-agent มีของตัวเองอยู่แล้ว)
+node_modules/
+.next/
+npm-debug.log*
+
