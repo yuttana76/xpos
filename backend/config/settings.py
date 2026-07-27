@@ -110,6 +110,20 @@ if not DEBUG:
     SECURE_HSTS_PRELOAD = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
 
+# --- Store → Cloud sync (§17 spec-xpost-gemini.md) ---
+# ว่างเปล่าตอนรันเป็น cloud deployment เอง หรือร้านที่ยังไม่ provision — sync_with_cloud_task จะ no-op
+CLOUD_API_URL = config("CLOUD_API_URL", default="")
+CLOUD_SYNC_KEY = config("CLOUD_SYNC_KEY", default="")
+
+CELERY_BROKER_URL = config("CELERY_BROKER_URL", default="redis://redis:6379/0")
+CELERY_RESULT_BACKEND = config("CELERY_RESULT_BACKEND", default="redis://redis:6379/0")
+CELERY_BEAT_SCHEDULE = {
+    "sync-with-cloud": {
+        "task": "apps.sync.tasks.sync_with_cloud_task",
+        "schedule": config("SYNC_INTERVAL_SECONDS", default=7200, cast=int),
+    },
+}
+
 REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": ["django_filters.rest_framework.DjangoFilterBackend"],
     "DEFAULT_AUTHENTICATION_CLASSES": [

@@ -2,6 +2,8 @@ from rest_framework import serializers
 
 from apps.floor.models import Table, Zone
 from apps.menu.models import Category, KitchenPrinter, MenuItem, ModifierGroup, ModifierOption
+from apps.staff.models import Staff
+from apps.tenancy.models import Store
 
 
 class ZoneSyncSerializer(serializers.ModelSerializer):
@@ -53,3 +55,28 @@ class ModifierOptionSyncSerializer(serializers.ModelSerializer):
     class Meta:
         model = ModifierOption
         fields = ["id", "group", "name", "extra_price", "is_active", "updated_at"]
+
+
+class StaffSyncSerializer(serializers.ModelSerializer):
+    """เฉพาะ StoreProvisionPullView (StoreSync auth) เท่านั้น — ไม่ใช้กับ device pull ทั่วไป
+    เพราะมี pin_code_hash ซึ่งไม่ควรหลุดไปที่ browser/IndexedDB"""
+
+    class Meta:
+        model = Staff
+        fields = ["id", "name", "pin_code_hash", "role", "is_active", "updated_at"]
+
+
+class StoreSettingsSyncSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Store
+        fields = [
+            "id",
+            "store_code",
+            "name",
+            "tax_id",
+            "address",
+            "vat_rate",
+            "service_charge_rate",
+            "is_active",
+            "updated_at",
+        ]

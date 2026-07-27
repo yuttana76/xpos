@@ -5,6 +5,7 @@ export interface DeviceConfig {
   apiBaseUrl: string;
   storeCode: string; // รหัสร้านสั้นๆ ใช้แทน UUID ตอนตั้งค่าอุปกรณ์/login เช่น XPOS01
   deviceId: string; // prefix ใบเสร็จ เช่น POS01
+  customerOrderBaseUrl?: string; // URL ที่ลูกค้าสแกนแล้วเข้าถึงได้ (ไม่ใช่ apiBaseUrl) — ว่างได้ ถ้าว่างใช้ window.location.origin แทน
 }
 
 export interface StoreSettings {

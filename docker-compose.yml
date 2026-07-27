@@ -29,10 +29,43 @@ services:
     command: >
       sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
 
+  # --- Store → Cloud sync (§17 spec-xpost-gemini.md) ---
+  # ทั้งสามตัวนี้รันได้เฉยๆ แม้ยังไม่ตั้งค่า CLOUD_API_URL/CLOUD_SYNC_KEY ใน .env — sync_with_cloud_task
+  # จะ no-op ทุกรอบ ไม่กระทบการทำงานปกติของร้าน (ไม่ block/ไม่ error)
+  redis:
+    image: redis:7-alpine
+
+  celery-worker:
+    build: ./backend
+    env_file: .env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: celery -A config worker -l info
+
+  celery-beat:
+    build: ./backend
+    env_file: .env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: celery -A config beat -l info
+
   frontend:
     build: ./frontend
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8080
+      # ค่า default ใช้ได้เฉพาะตอนพนักงาน+ลูกค้าเปิดจากเครื่องเดียวกัน (localhost) — ถ้าต้องการให้ลูกค้า
+      # สแกน QR สั่งอาหารเองจากมือถือ ต้องตั้งเป็น LAN IP ของเครื่องนี้ใน .env เช่น
+      # NEXT_PUBLIC_API_BASE_URL=http://192.168.1.48:8080 (ดู README หัวข้อ "QR สั่งอาหารเองผ่าน LAN")
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
     volumes:
       - ./frontend:/app
       - /app/node_modules

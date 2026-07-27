@@ -306,3 +306,130 @@ Carried over from the original spec's Phase 2 table (still not done): Split paym
 3. To test as an Owner with multiple stores, create a second `Store` + `Staff`, then add it to the first owner's `additional_stores` via Django admin.
 4. Backend tests: `python manage.py test` (fast, ~2s, 11 tests — all in `apps/orders/tests.py`).
 5. When adding any new synced master-data model or endpoint: inherit `SoftDeleteModelViewSet`, scope via JWT `store_id` (never trust client-supplied store IDs), and if you ever bulk-`.update()` rows that matter to sync, remember to bump `updated_at` explicitly (§8.4).
+
+---
+
+## 17. Multi-store cloud sync — local-per-store deployment
+
+**Why this exists:** §1–§16 describe offline-first at the *browser/device* level only —
+each device mirrors master data into its own Dexie/IndexedDB, but cross-device
+consistency within one store (e.g. the `/floor` kitchen-status panel via `GET
+/api/orders/open/`) still requires hitting the shared cloud backend. If a store's
+internet drops and it runs multiple terminals, those terminals stop seeing each
+other's live state until connectivity returns. §17 adds a second, independent
+deployment mode that fixes this: run the **full stack on the store's own LAN**, so the
+store operates 100% normally — including cross-terminal consistency — with or without
+internet, and only push/pull to a central cloud a few times a day purely so the owner
+can review data remotely.
+
+### 17.1 Cloud vs. store deployment
+
+No new compose file was added. The two existing files now have distinct roles:
+- **`docker-compose.prod.yml`** — the **cloud** deployment (public HTTPS, one shared
+  Postgres, what §1–§16 always assumed).
+- **`docker-compose.yml`** — already LAN-only (`localhost` ports, no TLS); this is now
+  also the **store** deployment. A store runs this on a machine on its own LAN with
+  its own local Postgres. It is the *same Django image* as the cloud — behavior
+  differs only by which optional env vars are set (`CLOUD_API_URL`, `CLOUD_SYNC_KEY`)
+  and which services are actually doing anything.
+
+A store-local Postgres holds exactly one store's data; none of the local-side sync
+code filters by `store_id` because there's only ever one.
+
+### 17.2 Design decisions (confirmed, not to be re-litigated casually)
+
+- **Master data (menu/floor/staff) is authored centrally at the cloud and pulled down
+  into each store** — not edited locally and pushed up. A store's `/manage` UI still
+  works against its local backend for *display*, but the source of truth for
+  menu/floor/staff is the cloud; local edits to those models are not part of this
+  sync (out of scope — if that's ever needed it requires a master-data push endpoint
+  and a conflict-resolution policy, deliberately not built here).
+- **Scheduling uses Celery beat + Redis**, not a bare loop/cron, for built-in
+  retry/monitoring when the upstream HTTP call fails.
+- Because every model already uses UUIDv4 PKs (rule #1) and `SyncOrdersPushView` was
+  already idempotent-by-UUID (rule #4), many independent per-store Postgres databases
+  push into one shared cloud Postgres database with no ID-collision risk and no new ID
+  scheme.
+- No FK-ordering/conflict problem on push: any menu item/table/staff UUID an order
+  references was itself pulled from the cloud first, so it already exists cloud-side
+  before the order push ever references it.
+
+### 17.3 Sync flow
+
+Both directions reuse existing `apps/sync` endpoints/logic almost unchanged:
+
+1. **Cloud → Store (pull).** The store's Celery task calls `GET
+   /api/sync/store/pull/?since=...` (new — `StoreProvisionPullView`). This returns
+   everything `SyncPullView` already returns (zones/tables/printers/categories/
+   menu_items/modifier_groups/modifier_options via the shared `_master_data_since()`
+   helper) **plus** `staff` (so PIN login works locally even offline — includes
+   `pin_code_hash`, which is why this is a separate endpoint from the device-facing
+   `SyncPullView` and requires `StoreSync` auth, never staff JWT) and `store_settings`
+   (vat_rate, tax_id, address, etc). The store applies it as upsert-by-UUID into its
+   own local Postgres (`apps/sync/upstream.py::apply_master_data_payload`, in FK
+   dependency order: store → staff → zones → kitchen_printers → tables → categories →
+   menu_items → modifier_groups (+ M2M) → modifier_options).
+2. **Store → Cloud (push).** The store's Celery task POSTs locally-changed
+   Orders/OrderItems to the cloud's existing `POST /api/sync/orders/push/` — same
+   view, same idempotent-by-UUID body, unchanged. It now also accepts `StoreSync` auth
+   in addition to staff JWT (both derive `store_id` from the authenticated principal,
+   never from the payload — rule #5 still holds).
+
+### 17.4 New auth: `StoreSyncKeyAuthentication`
+
+`apps/common/authentication.py`. Header `Authorization: StoreSync
+<store_code>:<secret>` — a machine-to-machine credential distinct from staff PIN JWT,
+used only by a store's own backend talking to the cloud (never by browsers). Looks up
+`Store` by `store_code` (existing unique field), verifies `secret` against
+`Store.sync_key_hash` via `check_password` (same hashing convention as staff PINs).
+Produces a `StoreSyncPrincipal` (`.store_id`, `.is_store_principal = True`). New
+permission `IsStoreSyncAuthenticated` (`apps/common/permissions.py`) checks that
+marker — used by `StoreProvisionPullView` so it can never be reached via staff JWT.
+Auth failures return **403**, not 401 — DRF's default when an authentication class
+doesn't define `authenticate_header()` (same as the existing `StaffJWTAuthentication`).
+
+Generate/rotate a store's key on the **cloud** deployment:
+```bash
+docker compose -f docker-compose.prod.yml run --rm backend \
+  python manage.py generate_store_sync_key <store_code>
+```
+Prints `store_code:secret` once — that full string is `CLOUD_SYNC_KEY` in the store's
+local `.env`.
+
+### 17.5 New pieces
+
+- `Store.sync_key_hash` (`apps/tenancy/models.py`) — hashed the same way as
+  `Staff.pin_code_hash`.
+- `apps/sync/models.py::UpstreamSyncState` — singleton (`id=1`) cursor
+  (`last_pull_at`, `last_push_at`) living in the *store's* local DB only. The table
+  exists in the cloud DB too (same app) but is never populated there.
+- `apps/sync/upstream.py` — the store-side HTTP client: `apply_master_data_payload()`,
+  `pull_from_cloud()`, `_build_order_push_payload()`, `push_orders_to_cloud()`. Uses
+  `requests`.
+- `apps/sync/tasks.py::sync_with_cloud_task` — Celery shared task, `autoretry_for=
+  (requests.RequestException,)` with backoff. **No-ops with a log line whenever
+  `CLOUD_API_URL`/`CLOUD_SYNC_KEY` are blank** — this is what makes it always safe to
+  run on the cloud deployment itself and on stores not yet provisioned; nothing about
+  normal order-taking/printing/payment ever depends on it.
+- `apps/sync/management/commands/sync_now.py` — runs `pull_from_cloud()` +
+  `push_orders_to_cloud()` synchronously, for manual testing without waiting for the
+  beat schedule.
+- `config/celery.py` + `config/__init__.py` — standard Django+Celery bootstrap.
+- Settings: `CLOUD_API_URL`, `CLOUD_SYNC_KEY` (both default `""`), `CELERY_BROKER_URL`
+  / `CELERY_RESULT_BACKEND` (default `redis://redis:6379/0`), `CELERY_BEAT_SCHEDULE`
+  running `sync_with_cloud_task` every `SYNC_INTERVAL_SECONDS` (default 7200 = 2h).
+- `docker-compose.yml` gained three services: `redis`, `celery-worker`, `celery-beat`
+  (all harmless no-ops when `CLOUD_SYNC_KEY` is unset).
+
+### 17.6 Verified end-to-end
+
+Two independent stacks (separate Postgres, separate Redis/Celery, one acting as
+"cloud" on the usual ports, one as a second "store" with overridden ports) were
+brought up and exercised directly: `generate_store_sync_key` on the cloud → pasted
+into the store's env → `manage.py sync_now` on the store pulled zones/tables/
+menu_items/staff/store_settings and applied them locally → PIN login succeeded
+against the *store's own* backend (no cloud involved) → an order opened and an item
+added purely through the store's local API → a second `sync_now` pushed it → the order
+appeared in the cloud's DB with correct recalculated totals (VAT/service charge intact
+per rule #12). `celery-worker`/`celery-beat` boot cleanly and register the task; the
+task no-ops cleanly on the cloud deployment where `CLOUD_SYNC_KEY` is blank.

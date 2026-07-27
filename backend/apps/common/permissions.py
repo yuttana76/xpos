@@ -22,3 +22,15 @@ class IsOwner(BasePermission):
         if not (user and getattr(user, "is_authenticated", False)):
             return False
         return user.role == Staff.Role.OWNER
+
+
+class IsStoreSyncAuthenticated(BasePermission):
+    """ใช้เฉพาะ endpoint ที่ store-local backend เรียก sync ขึ้น cloud (StoreSyncKeyAuthentication) เท่านั้น"""
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(
+            user
+            and getattr(user, "is_authenticated", False)
+            and getattr(user, "is_store_principal", False)
+        )

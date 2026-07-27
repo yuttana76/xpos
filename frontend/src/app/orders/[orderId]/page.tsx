@@ -3,9 +3,10 @@
 import { useEffect, useRef, useState, use as usePromise } from "react";
 import { useRouter } from "next/navigation";
 import { useLiveQuery } from "dexie-react-hooks";
+import { QRCodeSVG } from "qrcode.react";
 import { db } from "@/lib/db";
 import { api, ApiError } from "@/lib/api";
-import { getStaffSession } from "@/lib/session";
+import { getDeviceConfig, getStaffSession } from "@/lib/session";
 import { printAgent } from "@/lib/print";
 import { addItem as addItemAction } from "@/lib/orderActions";
 import { elapsedMinutes } from "@/lib/time";
@@ -51,11 +52,54 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
     originalSelectedOptionIds: string[];
   } | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [showQrModal, setShowQrModal] = useState(false);
+  const [qrPrinterId, setQrPrinterId] = useState("");
+  const [qrLinkCopied, setQrLinkCopied] = useState(false);
+  const [selectedKitchenItemIds, setSelectedKitchenItemIds] = useState<Set<string>>(new Set());
+  // เก็บ id ของรายการ PENDING ที่เคย auto-check ให้แล้ว — กันไม่ให้ effect ด้านล่าง (รันทุกครั้งที่ order
+  // เปลี่ยน เช่น poll ทุก 5s) ไป check รายการที่พนักงานตั้งใจ uncheck เองกลับมาซ้ำๆ
+  const autoCheckedPendingIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const tick = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(tick);
   }, []);
+
+  // รายการ PENDING ใหม่ (เพิ่งเพิ่ม/แก้ไข) auto-check ให้ครั้งแรกที่เห็น ส่วนรายการที่ถูกลบไปแล้วก็เอาออกจาก
+  // selection ด้วย — ไม่แตะ selection ที่พนักงานเลือกเอง (ติ๊ก/ไม่ติ๊กรายการที่ส่งครัวไปแล้ว) ตอน refresh รอบถัดๆ ไป
+  useEffect(() => {
+    if (!order) return;
+    setSelectedKitchenItemIds((prev) => {
+      const next = new Set(prev);
+      for (const item of order.items) {
+        if (item.kitchen_status === "PENDING" && !autoCheckedPendingIds.current.has(item.id)) {
+          next.add(item.id);
+          autoCheckedPendingIds.current.add(item.id);
+        }
+      }
+      for (const id of Array.from(next)) {
+        if (!order.items.some((i) => i.id === id)) next.delete(id);
+      }
+      return next;
+    });
+  }, [order]);
+
+  const toggleKitchenItemSelected = (itemId: string) => {
+    setSelectedKitchenItemIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  };
+
+  const allKitchenItemsSelected =
+    !!order && order.items.length > 0 && order.items.every((i) => selectedKitchenItemIds.has(i.id));
+
+  const toggleSelectAllKitchenItems = () => {
+    if (!order) return;
+    setSelectedKitchenItemIds(allKitchenItemsSelected ? new Set() : new Set(order.items.map((i) => i.id)));
+  };
 
   const categories = useLiveQuery(() => db.categories.filter((c) => c.is_active).toArray()) ?? [];
   const menuItems = useLiveQuery(() => db.menu_items.filter((m) => m.is_active && m.is_available).toArray()) ?? [];
@@ -68,6 +112,27 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
     ? menuItems.filter((m) => m.name.toLowerCase().includes(menuSearch.trim().toLowerCase()))
     : menuItems;
   const tableName = order?.table ? diningTables.find((t) => t.id === order.table)?.name ?? null : null;
+  const selfOrderUrl = order?.session_token
+    ? `${(getDeviceConfig()?.customerOrderBaseUrl?.trim() || window.location.origin).replace(/\/$/, "")}/order-session/${order.session_token}`
+    : null;
+
+  const copySelfOrderUrl = async () => {
+    if (!selfOrderUrl) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard API unavailable");
+      await navigator.clipboard.writeText(selfOrderUrl);
+    } catch {
+      // clipboard API ใช้ไม่ได้บาง browser ตอนรันผ่าน http (ไม่ใช่ https/localhost) — fallback ด้วยวิธีเก่า
+      const input = document.createElement("input");
+      input.value = selfOrderUrl;
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand("copy");
+      document.body.removeChild(input);
+    }
+    setQrLinkCopied(true);
+    setTimeout(() => setQrLinkCopied(false), 2000);
+  };
 
   const modalMenuItem = itemModal ? menuItems.find((m) => m.id === itemModal.menuItemId) : null;
   const modalGroups = itemModal
@@ -259,17 +324,24 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
   };
 
   const sendToKitchen = async () => {
-    if (!order || order.items.length === 0) return;
-    // พิมพ์รายการทั้งหมดในบิลทุกครั้ง (ไม่ใช่แค่รายการที่เพิ่งเพิ่มล่าสุด) เพื่อให้ครัวเห็นออเดอร์เต็มเสมอ
-    const pendingItems = order.items.filter((i) => i.kitchen_status === "PENDING");
+    if (!order) return;
+    // พิมพ์เฉพาะรายการที่ติ๊กเลือกไว้ — แยกเป็น 2 กลุ่ม: PENDING (ยังไม่เคยส่งครัว) พิมพ์ปกติแล้วเปลี่ยนเป็น
+    // SENT, กับรายการที่ส่งครัวไปแล้ว (SENT/SERVED) ที่ติ๊กไว้ด้วย = พิมพ์ซ้ำ ไม่เปลี่ยนสถานะ
+    const selectedItems = order.items.filter((i) => selectedKitchenItemIds.has(i.id));
+    if (selectedItems.length === 0) return;
+    const pendingItems = selectedItems.filter((i) => i.kitchen_status === "PENDING");
+    const alreadySentItems = selectedItems.filter((i) => i.kitchen_status !== "PENDING");
     try {
-      await printItemsByCategory(order.items, pendingItems.length === 0);
       if (pendingItems.length > 0) {
+        await printItemsByCategory(pendingItems, false);
         await api.post(`/api/orders/${orderId}/items/send-to-kitchen/`, {
           item_ids: pendingItems.map((i) => i.id),
         });
-        await refresh();
       }
+      if (alreadySentItems.length > 0) {
+        await printItemsByCategory(alreadySentItems, true);
+      }
+      if (pendingItems.length > 0) await refresh();
     } catch (err) {
       await handleOrderError(err, "พิมพ์ส่งครัวไม่สำเร็จ");
     }
@@ -426,10 +498,20 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
 
       {notice && <p className="text-sm text-amber-400">{notice}</p>}
 
-      {order.session_token && (
-        <div className="rounded bg-slate-900 border border-slate-800 p-3 text-xs text-slate-400 break-all">
-          QR self-order token: {order.session_token}
-        </div>
+      {selfOrderUrl && order.status === "OPEN" && (
+        <button
+          onClick={() => setShowQrModal(true)}
+          className="w-full rounded bg-slate-900 border border-slate-800 p-3 text-sm text-sky-300 hover:bg-slate-800"
+        >
+          แสดง QR ให้ลูกค้าสั่งเอง
+        </button>
+      )}
+
+      {order.status === "OPEN" && order.items.length > 0 && (
+        <label className="flex items-center gap-2 px-1 text-xs text-slate-400">
+          <input type="checkbox" checked={allKitchenItemsSelected} onChange={toggleSelectAllKitchenItems} />
+          เลือกทั้งหมด ({selectedKitchenItemIds.size}/{order.items.length})
+        </label>
       )}
 
       <div className="rounded-lg border border-slate-800 divide-y divide-slate-800">
@@ -442,7 +524,16 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
           const lineTotal = unitPriceWithModifiers * item.quantity;
           return (
             <div key={item.id} className="flex items-start justify-between p-3 text-sm">
-              <div>
+              <div className="flex items-start gap-2">
+                {order.status === "OPEN" && (
+                  <input
+                    type="checkbox"
+                    checked={selectedKitchenItemIds.has(item.id)}
+                    onChange={() => toggleKitchenItemSelected(item.id)}
+                    className="mt-1"
+                  />
+                )}
+                <div>
                 <div className="font-medium">
                   {menuItemName(item.menu_item)}{" "}
                   {item.is_takeaway && <span className="text-amber-400 text-xs">[กลับบ้าน]</span>}
@@ -464,6 +555,7 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
                       .join(", ")}
                   </div>
                 )}
+                </div>
               </div>
               <div className="flex gap-2 shrink-0">
                 {item.kitchen_status === "SENT" && (
@@ -507,10 +599,10 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
           </button>
           <button
             onClick={sendToKitchen}
-            disabled={order.items.length === 0}
+            disabled={selectedKitchenItemIds.size === 0}
             className="rounded bg-amber-700 py-2 text-sm font-medium hover:bg-amber-600 disabled:opacity-40"
           >
-            🖨 พิมพ์ส่งครัว
+            🖨 พิมพ์ที่เลือก ({selectedKitchenItemIds.size})
           </button>
         </div>
       )}
@@ -770,6 +862,95 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
                 {itemModal.mode === "edit" ? "บันทึกการแก้ไข" : "เพิ่มลงบิล"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showQrModal && selfOrderUrl && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <style>{`
+            @media print {
+              body * { visibility: hidden; }
+              .qr-print-area, .qr-print-area * { visibility: visible; }
+              .qr-print-area { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1rem; }
+            }
+          `}</style>
+          <div className="w-full max-w-sm rounded-lg bg-slate-900 border border-slate-800 p-4 space-y-4">
+            <div className="qr-print-area flex flex-col items-center gap-3 rounded bg-white p-4">
+              <QRCodeSVG value={selfOrderUrl} size={220} />
+              <p className="text-sm text-black text-center">
+                {order.receipt_number}
+                {tableName ? ` · โต๊ะ ${tableName}` : ""}
+                <br />
+                สแกนเพื่อสั่งอาหารเอง
+              </p>
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                readOnly
+                value={selfOrderUrl}
+                onFocus={(e) => e.target.select()}
+                className="min-w-0 flex-1 rounded bg-slate-800 px-3 py-2 text-xs text-slate-300"
+              />
+              <button
+                onClick={copySelfOrderUrl}
+                className="shrink-0 rounded bg-slate-800 px-3 py-2 text-sm hover:bg-slate-700"
+              >
+                {qrLinkCopied ? "คัดลอกแล้ว ✓" : "คัดลอกลิงก์"}
+              </button>
+            </div>
+            <p className="text-xs text-slate-500">
+              เอาลิงก์นี้ไปเปิดในเบราว์เซอร์อื่น (เช่นเครื่องคอมพิวเตอร์) เพื่อทดสอบเสมือนสแกนจากมือถือได้
+            </p>
+
+            <button
+              onClick={() => window.print()}
+              className="w-full rounded bg-sky-600 py-2 text-sm font-medium hover:bg-sky-500"
+            >
+              พิมพ์ (เบราว์เซอร์)
+            </button>
+
+            <div className="space-y-2 border-t border-slate-800 pt-3">
+              <label className="block text-sm">
+                พิมพ์ที่เครื่องพิมพ์
+                <select
+                  value={qrPrinterId}
+                  onChange={(e) => setQrPrinterId(e.target.value)}
+                  className="mt-1 w-full rounded bg-slate-800 px-3 py-2 text-sm"
+                >
+                  <option value="">เลือกเครื่องพิมพ์...</option>
+                  {kitchenPrinters.map((printer) => (
+                    <option key={printer.id} value={printer.id}>
+                      {printer.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                onClick={() => {
+                  const printer = kitchenPrinters.find((p) => p.id === qrPrinterId);
+                  if (!printer) return;
+                  printAgent.printSelfOrderQr({
+                    printerIp: printer.ip_address,
+                    url: selfOrderUrl,
+                    tableName,
+                    receiptNumber: order.receipt_number,
+                  });
+                }}
+                disabled={!qrPrinterId}
+                className="w-full rounded bg-slate-800 py-2 text-sm hover:bg-slate-700 disabled:opacity-50"
+              >
+                พิมพ์ที่เครื่องพิมพ์
+              </button>
+            </div>
+
+            <button
+              onClick={() => setShowQrModal(false)}
+              className="w-full rounded bg-slate-800 py-2 text-sm hover:bg-slate-700"
+            >
+              ปิด
+            </button>
           </div>
         </div>
       )}

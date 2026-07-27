@@ -7,11 +7,15 @@ from django.utils.dateparse import parse_datetime
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.common.authentication import StaffJWTAuthentication, StoreSyncKeyAuthentication
+from apps.common.permissions import IsStoreSyncAuthenticated
 from apps.floor.models import Table, Zone
 from apps.menu.models import Category, KitchenPrinter, MenuItem, ModifierGroup, ModifierOption
 from apps.orders import services
 from apps.orders.models import Order, OrderItem, OrderItemModifier
 from apps.orders.serializers import OrderSerializer
+from apps.staff.models import Staff
+from apps.tenancy.models import Store
 
 from .serializers import (
     CategorySyncSerializer,
@@ -19,6 +23,8 @@ from .serializers import (
     MenuItemSyncSerializer,
     ModifierGroupSyncSerializer,
     ModifierOptionSyncSerializer,
+    StaffSyncSerializer,
+    StoreSettingsSyncSerializer,
     TableSyncSerializer,
     ZoneSyncSerializer,
 )
@@ -33,39 +39,65 @@ def _parse_dt(value, default=None):
     return parsed or default
 
 
+def _master_data_since(store_id, since):
+    """query master data ทั้งหมดของ store ที่เปลี่ยนหลัง `since` — ใช้ร่วมกันโดย SyncPullView (device)
+    และ StoreProvisionPullView (store-local backend), rule ข้อ 4, 5"""
+    zones = Zone.objects.filter(store_id=store_id, updated_at__gt=since)
+    tables = Table.objects.filter(zone__store_id=store_id, updated_at__gt=since)
+    printers = KitchenPrinter.objects.filter(store_id=store_id, updated_at__gt=since)
+    categories = Category.objects.filter(store_id=store_id, updated_at__gt=since)
+    menu_items = MenuItem.objects.filter(store_id=store_id, updated_at__gt=since)
+    modifier_groups = ModifierGroup.objects.filter(store_id=store_id, updated_at__gt=since)
+    modifier_options = ModifierOption.objects.filter(
+        group__store_id=store_id, updated_at__gt=since
+    )
+
+    return {
+        "server_time": timezone.now().isoformat(),
+        "zones": ZoneSyncSerializer(zones, many=True).data,
+        "tables": TableSyncSerializer(tables, many=True).data,
+        "kitchen_printers": KitchenPrinterSyncSerializer(printers, many=True).data,
+        "categories": CategorySyncSerializer(categories, many=True).data,
+        "menu_items": MenuItemSyncSerializer(menu_items, many=True).data,
+        "modifier_groups": ModifierGroupSyncSerializer(modifier_groups, many=True).data,
+        "modifier_options": ModifierOptionSyncSerializer(modifier_options, many=True).data,
+    }
+
+
 class SyncPullView(APIView):
     """GET /api/sync/pull/?since=<ISO8601> — เฉพาะ master data ของ store ที่ผูกกับ JWT (rule ข้อ 4, 5)"""
+
+    def get(self, request):
+        since = _parse_dt(request.query_params.get("since"), default=EPOCH)
+        return Response(_master_data_since(request.user.store_id, since))
+
+
+class StoreProvisionPullView(APIView):
+    """GET /api/sync/store/pull/?since=<ISO8601> — เหมือน SyncPullView แต่เพิ่ม staff + store_settings
+    เข้ามาด้วย สำหรับ store-local backend ใช้ provision ตัวเองให้ PIN login ทำงานได้แม้ออฟไลน์ (§17
+    spec-xpost-gemini.md) จำกัดเฉพาะ StoreSync auth เท่านั้น เพราะมี pin_code_hash ติดมาด้วย"""
+
+    authentication_classes = [StoreSyncKeyAuthentication]
+    permission_classes = [IsStoreSyncAuthenticated]
 
     def get(self, request):
         store_id = request.user.store_id
         since = _parse_dt(request.query_params.get("since"), default=EPOCH)
 
-        zones = Zone.objects.filter(store_id=store_id, updated_at__gt=since)
-        tables = Table.objects.filter(zone__store_id=store_id, updated_at__gt=since)
-        printers = KitchenPrinter.objects.filter(store_id=store_id, updated_at__gt=since)
-        categories = Category.objects.filter(store_id=store_id, updated_at__gt=since)
-        menu_items = MenuItem.objects.filter(store_id=store_id, updated_at__gt=since)
-        modifier_groups = ModifierGroup.objects.filter(store_id=store_id, updated_at__gt=since)
-        modifier_options = ModifierOption.objects.filter(
-            group__store_id=store_id, updated_at__gt=since
-        )
-
-        return Response(
-            {
-                "server_time": timezone.now().isoformat(),
-                "zones": ZoneSyncSerializer(zones, many=True).data,
-                "tables": TableSyncSerializer(tables, many=True).data,
-                "kitchen_printers": KitchenPrinterSyncSerializer(printers, many=True).data,
-                "categories": CategorySyncSerializer(categories, many=True).data,
-                "menu_items": MenuItemSyncSerializer(menu_items, many=True).data,
-                "modifier_groups": ModifierGroupSyncSerializer(modifier_groups, many=True).data,
-                "modifier_options": ModifierOptionSyncSerializer(modifier_options, many=True).data,
-            }
-        )
+        data = _master_data_since(store_id, since)
+        data["store_settings"] = StoreSettingsSyncSerializer(Store.objects.get(id=store_id)).data
+        data["staff"] = StaffSyncSerializer(
+            Staff.objects.filter(store_id=store_id, updated_at__gt=since), many=True
+        ).data
+        return Response(data)
 
 
 class SyncOrdersPushView(APIView):
-    """POST /api/sync/orders/push/ — bulk, idempotent ตาม Order UUID (rule ข้อ 4)"""
+    """POST /api/sync/orders/push/ — bulk, idempotent ตาม Order UUID (rule ข้อ 4)
+    รับได้ทั้ง staff JWT (device ปกติ) และ StoreSync key (store-local backend, §17 spec-xpost-gemini.md)
+    — ทั้งสองแบบอ่าน store_id จาก request.user.store_id เหมือนกัน ไม่มีการเปลี่ยน logic ด้านล่าง"""
+
+    authentication_classes = [StaffJWTAuthentication, StoreSyncKeyAuthentication]
 
     def post(self, request):
         store_id = request.user.store_id

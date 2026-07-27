@@ -10,10 +10,13 @@ export default function SetupPage() {
   const [apiBaseUrl, setApiBaseUrl] = useState(existing?.apiBaseUrl ?? "http://localhost:8010");
   const [storeCode, setStoreCode] = useState(existing?.storeCode ?? "");
   const [deviceId, setDeviceId] = useState(existing?.deviceId ?? "POS01");
+  const [customerOrderBaseUrl, setCustomerOrderBaseUrl] = useState(
+    existing?.customerOrderBaseUrl ?? ""
+  );
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    setDeviceConfig({ apiBaseUrl, storeCode, deviceId });
+    setDeviceConfig({ apiBaseUrl, storeCode, deviceId, customerOrderBaseUrl });
     router.replace("/login");
   };
 
@@ -57,6 +60,19 @@ export default function SetupPage() {
             onChange={(e) => setDeviceId(e.target.value)}
             required
           />
+        </label>
+
+        <label className="block text-sm">
+          URL สำหรับลูกค้าสแกน QR สั่งอาหารเอง (ไม่บังคับ)
+          <input
+            className="mt-1 w-full rounded bg-slate-800 px-3 py-2"
+            value={customerOrderBaseUrl}
+            onChange={(e) => setCustomerOrderBaseUrl(e.target.value)}
+            placeholder="เว้นว่างไว้ = ใช้ URL หน้านี้อัตโนมัติ"
+          />
+          <span className="mt-1 block text-xs text-slate-500">
+            ใส่เฉพาะกรณีที่มือถือลูกค้าเข้าถึงเครื่องนี้ด้วยที่อยู่คนละอันกับที่พนักงานใช้อยู่ตอนนี้
+          </span>
         </label>
 
         <button

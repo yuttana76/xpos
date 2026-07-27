@@ -13,6 +13,12 @@ class Store(models.Model):
     address = models.CharField(max_length=255, blank=True, null=True, help_text="ที่อยู่ร้าน — พิมพ์บนใบเสร็จ")
     vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=7.00)
     service_charge_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
+    sync_key_hash = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="hash ของ secret ที่ store-local backend ใช้ยืนยันตัวตนตอน sync ขึ้น cloud (ดู StoreSyncKeyAuthentication) — สร้าง/หมุนด้วย manage.py generate_store_sync_key",
+    )
     is_active = models.BooleanField(default=True)
     updated_at = models.DateTimeField(auto_now=True)
 

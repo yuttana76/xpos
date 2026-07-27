@@ -19,6 +19,14 @@ export interface KitchenTicketJob {
   }>;
 }
 
+export interface SelfOrderQrJob {
+  type: "self_order_qr";
+  printerIp: string;
+  url: string;
+  tableName: string | null;
+  receiptNumber: string;
+}
+
 export interface ReceiptJob {
   type: "receipt";
   receiptNumber: string;
@@ -56,6 +64,18 @@ function formatKitchenTicketForLog(job: KitchenTicketJob): string {
   return lines.join("\n");
 }
 
+function formatSelfOrderQrForLog(job: SelfOrderQrJob): string {
+  const lines = [
+    "==== SELF-ORDER QR ====",
+    `Printer IP: ${job.printerIp}`,
+    `Receipt: ${job.receiptNumber}`,
+    job.tableName ? `Table: ${job.tableName}` : "Table: -",
+    `URL: ${job.url}`,
+    "=========================",
+  ];
+  return lines.join("\n");
+}
+
 function formatReceiptForLog(job: ReceiptJob): string {
   // รูปแบบตามข้อกำหนดใบกำกับภาษีอย่างย่อของกรมสรรพากร (มาตรา 86/6): ต้องมีคำว่า "ใบกำกับภาษีอย่างย่อ",
   // ชื่อ/เลขผู้เสียภาษีผู้ขาย, เลขที่+วันที่ออก, รายการ/ราคาสินค้า
@@ -82,9 +102,14 @@ function formatReceiptForLog(job: ReceiptJob): string {
   return lines.join("\n");
 }
 
-async function sendPrintJob(job: KitchenTicketJob | ReceiptJob): Promise<boolean> {
+async function sendPrintJob(job: KitchenTicketJob | ReceiptJob | SelfOrderQrJob): Promise<boolean> {
   // log ข้อมูลที่ "จะพิมพ์" ไว้ใน browser console เสมอ — ไว้ตรวจสอบตอนยังไม่มีเครื่องพิมพ์จริงต่ออยู่
-  const preview = job.type === "kitchen_ticket" ? formatKitchenTicketForLog(job) : formatReceiptForLog(job);
+  const preview =
+    job.type === "kitchen_ticket"
+      ? formatKitchenTicketForLog(job)
+      : job.type === "self_order_qr"
+        ? formatSelfOrderQrForLog(job)
+        : formatReceiptForLog(job);
   console.log(`[print] ${job.type}\n${preview}`);
 
   try {
@@ -106,4 +131,6 @@ export const printAgent = {
   printKitchenTicket: (job: Omit<KitchenTicketJob, "type">) =>
     sendPrintJob({ type: "kitchen_ticket", ...job }),
   printReceipt: (job: Omit<ReceiptJob, "type">) => sendPrintJob({ type: "receipt", ...job }),
+  printSelfOrderQr: (job: Omit<SelfOrderQrJob, "type">) =>
+    sendPrintJob({ type: "self_order_qr", ...job }),
 };

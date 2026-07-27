@@ -89,7 +89,14 @@ class SelfOrderMenuView(APIView):
                     ],
                 }
             )
-        return Response({"order_id": str(order.id), "categories": payload})
+        return Response(
+            {
+                "order_id": str(order.id),
+                "table_name": order.table.name if order.table else None,
+                "order_type": order.order_type,
+                "categories": payload,
+            }
+        )
 
 
 class SelfOrderSubmitItemsView(APIView):

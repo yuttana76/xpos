@@ -43,6 +43,15 @@ cd print-agent && npm start       # http://localhost:9100
 
 > พอร์ต 5433/8010 (ไม่ใช่ 5432/8000 ตรงๆ) ถูกจงใจ map แบบนี้เพราะระหว่างพัฒนาเจอ port ชนกับโปรเจกต์อื่นในเครื่อง ถ้าเครื่องคุณไม่มีปัญหานี้ แก้กลับได้ใน [docker-compose.yml](docker-compose.yml)
 
+## QR สั่งอาหารเองผ่าน LAN
+
+ค่า default ทั้งหมด (`localhost`) ใช้ได้แค่ตอนเปิดจากเครื่องเดียวกับที่รันเซิร์ฟเวอร์ **มือถือลูกค้าจะเปิด `localhost` ไม่ได้เด็ดขาด** (ตีความเป็นตัวมันเองเสมอ) ถ้าจะให้ลูกค้าสแกน QR สั่งอาหารเองได้จริงจากมือถือบน WiFi เดียวกับร้าน ต้องตั้งค่าให้ชี้ไป LAN IP ของเครื่องที่รันเซิร์ฟเวอร์แทน:
+
+1. หา LAN IP ของเครื่อง: `ipconfig getifaddr en0` (Mac) หรือดูจาก `ipconfig`/`hostname -I`
+2. ใน backend `.env`: เพิ่ม IP นั้นเข้า `ALLOWED_HOSTS` และ `CORS_ALLOWED_ORIGINS`
+3. ตั้งค่า URL ของ frontend/API ให้เป็น LAN IP แทน `localhost` — ถ้ารัน frontend ด้วย `npm run dev` ให้สร้าง `frontend/.env.local` ใส่ `NEXT_PUBLIC_API_BASE_URL=http://<LAN_IP>:8010`; ถ้ารันผ่าน `docker compose up` (ทั้ง stack) ให้ตั้ง `NEXT_PUBLIC_API_BASE_URL=http://<LAN_IP>:8080` ใน `.env` แล้ว `docker compose up -d --build frontend`
+4. ที่หน้า `/setup` ของฝั่งพนักงาน ใส่ "URL สำหรับลูกค้าสแกน QR สั่งอาหารเอง" เป็น `http://<LAN_IP>:3000` — หรือจะเปิดหน้าพนักงานเองผ่าน LAN IP แทน `localhost` ตั้งแต่แรกก็พอ ไม่ต้องทำทั้งสองอย่าง (ระบบจะ auto-detect URL ปัจจุบันให้ถ้าช่องนี้ว่างไว้)
+
 ## ข้อมูล Login ทดสอบ (จาก `seed_demo`)
 
 หลังรัน `init.sh` จะได้ร้านตัวอย่าง "ร้านทดสอบ xPOS" มาพร้อม:
@@ -90,6 +99,32 @@ cd ../print-agent && npm install
 ```bash
 ENABLE_REAL_PRINTING=true npm start
 ```
+
+## Store → Cloud sync (offline-first per store, §17 spec-xpost-gemini.md)
+
+`docker-compose.yml` (this stack) runs entirely on the store's LAN and works fully
+with or without internet. To also mirror this store's data up to a central cloud
+deployment (`docker-compose.prod.yml`) every few hours, purely so the owner can review
+it remotely:
+
+```bash
+# On the CLOUD deployment: generate a credential for this store
+docker compose -f docker-compose.prod.yml run --rm backend \
+  python manage.py generate_store_sync_key XPOS01
+
+# On this STORE deployment: paste the printed value into .env
+CLOUD_API_URL=https://xpos.example.com
+CLOUD_SYNC_KEY=XPOS01:<secret printed above>
+SYNC_INTERVAL_SECONDS=7200   # 1-3 hours, in seconds
+
+docker compose up -d   # redis/celery-worker/celery-beat come up automatically
+```
+
+Menu/floor/staff master data is authored centrally at the cloud and pulled down here;
+this store only ever pushes its own Orders up. Leaving `CLOUD_SYNC_KEY` blank (the
+default) makes the sync task a no-op — nothing about normal order-taking, printing, or
+payment depends on it. Run `docker compose run --rm backend python manage.py sync_now`
+to trigger a sync immediately instead of waiting for the schedule.
 
 ## Known Phase 1 Limitations
 
