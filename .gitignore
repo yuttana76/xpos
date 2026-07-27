@@ -1,0 +1,48 @@
+# --- env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Python / Django (backend) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+db.sqlite3
+/backend/staticfiles/
+/backend/media/
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+celerybeat-schedule
+
+# --- Node / Next.js (frontend, print-agent) ---
+# กันเผื่อ subproject ใหม่ในอนาคตลืมสร้าง .gitignore ของตัวเอง (frontend/print-agent มีของตัวเองอยู่แล้ว)
+node_modules/
+.next/
+out/
+dist/
+build/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.tsbuildinfo
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- logs ---
+*.log
+
+# --- IDE / OS ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

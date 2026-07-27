@@ -1,0 +1,13 @@
+{
+  "name": "xpos-print-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Print Agent — รับ print job จาก PWA ผ่าน localhost แล้วส่งต่อ ESC/POS ไปเครื่องพิมพ์จริงใน LAN (rule ข้อ 8)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
