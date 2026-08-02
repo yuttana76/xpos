@@ -24,7 +24,7 @@ const REPORT_LINKS: Array<{ category: string; href: string; label: string }> = [
   { category: "ภาษี", href: "/reports/tax", label: "รายงานภาษีขาย" },
 ];
 
-const HIDDEN_ROUTES = new Set(["/", "/login", "/setup"]);
+const HIDDEN_ROUTES = new Set(["/", "/login"]);
 
 export function Sidebar() {
   const pathname = usePathname();

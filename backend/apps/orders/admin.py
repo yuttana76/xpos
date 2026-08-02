@@ -33,6 +33,12 @@ class OrderAdmin(admin.ModelAdmin):
 
 @admin.register(OrderItem)
 class OrderItemAdmin(admin.ModelAdmin):
-    list_display = ("menu_item", "order", "quantity", "kitchen_status", "channel", "is_takeaway")
+    list_display = ("menu_item", "order", "order_table", "quantity", "kitchen_status", "channel", "is_takeaway")
     list_filter = ("kitchen_status", "channel", "is_takeaway")
+    search_fields = ("order__receipt_number",)
+    list_select_related = ("order", "order__table")
     inlines = [OrderItemModifierInline]
+
+    @admin.display(description="โต๊ะ", ordering="order__table__name")
+    def order_table(self, obj):
+        return obj.order.table

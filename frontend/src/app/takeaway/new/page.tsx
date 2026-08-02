@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, ApiError } from "@/lib/api";
-import { getDeviceConfig } from "@/lib/session";
+import { getDeviceConfig, getStaffSession } from "@/lib/session";
 import { nextReceiptNumber } from "@/lib/receipt";
 import type { OrderRow } from "@/lib/db";
 
@@ -17,11 +17,12 @@ export default function NewTakeawayPage() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const device = getDeviceConfig();
-    if (!device) return;
+    const session = getStaffSession();
+    if (!device || !session) return;
     setLoading(true);
     setError(null);
     try {
-      const receiptNumber = await nextReceiptNumber(device.deviceId);
+      const receiptNumber = await nextReceiptNumber(session.store.device_id);
       const order = await api.post<OrderRow>("/api/orders/takeaway/", {
         receipt_number: receiptNumber,
         customer_name: customerName || null,

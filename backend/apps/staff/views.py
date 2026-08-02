@@ -2,6 +2,7 @@ from django.contrib.auth.hashers import check_password
 from django.utils import timezone
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 
 from apps.audit.models import AuditLog
@@ -11,26 +12,35 @@ from apps.tenancy.models import Store
 from .models import Staff
 
 
+class PinLoginRateThrottle(AnonRateThrottle):
+    """จำกัดจำนวนครั้ง pin-login ต่อ IP — PIN มักเป็นเลข 4 หลัก (entropy ต่ำ) และ endpoint นี้
+    ไม่มี authentication ใดๆ (AllowAny) จึงเสี่ยง brute-force ได้ตรงๆ ถ้าไม่ throttle
+    (ตาม Django security checklist อย่างเป็นทางการ — ดู backend/CLAUDE.md §3)"""
+
+    scope = "pin_login"
+
+
 class PinLoginView(APIView):
-    """POST /api/auth/pin-login/ — {store_code, device_id, pin} -> JWT ผูก store_id/device_id
+    """POST /api/auth/pin-login/ — {store_code, pin} -> JWT ผูก store_id/device_id
 
     store_code เป็นรหัสร้านสั้นๆ ที่ client ใช้ระบุ store ตอนตั้งค่าอุปกรณ์/login เท่านั้น
     (ใช้แทน UUID เพราะพิมพ์/จำง่ายกว่า) หลังจากออก JWT แล้ว ทุก request ถัดไปต้องอ่าน store_id
     จาก JWT เท่านั้น (rule ข้อ 5)
+
+    device_id ไม่รับจาก client อีกต่อไป — อ่านจาก Store.device_id แทน (ตั้งค่าที่ Django admin)
+    เพราะระบบรองรับเครื่อง POS เดียวต่อร้าน จึงไม่มีเหตุผลให้ client เป็นคนกำหนดเอง
     """
 
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_classes = [PinLoginRateThrottle]
 
     def post(self, request):
         store_code = request.data.get("store_code")
-        device_id = request.data.get("device_id")
         pin = request.data.get("pin")
 
-        if not store_code or not device_id or not pin:
-            return Response(
-                {"detail": "store_code, device_id, pin จำเป็นต้องระบุ"}, status=400
-            )
+        if not store_code or not pin:
+            return Response({"detail": "store_code, pin จำเป็นต้องระบุ"}, status=400)
 
         try:
             store = Store.objects.get(store_code=store_code, is_active=True)
@@ -48,7 +58,7 @@ class PinLoginView(APIView):
                 store_id=store.id,
                 staff=None,
                 action=AuditLog.Action.STAFF_LOGIN_FAILED,
-                device_id=device_id,
+                device_id=store.device_id,
                 target_model="Store",
                 target_id=store.id,
                 created_at=timezone.now(),
@@ -58,7 +68,7 @@ class PinLoginView(APIView):
         token = issue_staff_token(
             staff_id=staff_match.id,
             store_id=staff_match.store_id,
-            device_id=device_id,
+            device_id=store.device_id,
             role=staff_match.role,
         )
         store = staff_match.store
@@ -75,10 +85,12 @@ class PinLoginView(APIView):
                 "store": {
                     "id": str(store.id),
                     "name": store.name,
+                    "device_id": store.device_id,
                     "vat_rate": str(store.vat_rate),
                     "service_charge_rate": str(store.service_charge_rate),
                     "tax_id": store.tax_id,
                     "address": store.address,
+                    "customer_order_base_url": store.customer_order_base_url,
                 },
             }
         )

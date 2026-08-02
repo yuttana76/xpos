@@ -117,6 +117,17 @@ CLOUD_SYNC_KEY = config("CLOUD_SYNC_KEY", default="")
 
 CELERY_BROKER_URL = config("CELERY_BROKER_URL", default="redis://redis:6379/0")
 CELERY_RESULT_BACKEND = config("CELERY_RESULT_BACKEND", default="redis://redis:6379/0")
+
+# DB 1 (separate from Celery's DB 0) — Django's cache framework, used by DRF's throttle
+# classes (see REST_FRAMEWORK below). Must be a *shared* cache (not per-process locmem),
+# otherwise each gunicorn/uwsgi worker keeps its own throttle counter and the effective
+# rate limit becomes (configured rate × worker count) instead of the configured rate.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": config("DJANGO_CACHE_URL", default="redis://redis:6379/1"),
+    }
+}
 CELERY_BEAT_SCHEDULE = {
     "sync-with-cloud": {
         "task": "apps.sync.tasks.sync_with_cloud_task",
@@ -132,4 +143,9 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "apps.common.permissions.IsStaffAuthenticated",
     ],
+    # pin_login: brute-force guard on the unauthenticated PIN login endpoint (per-IP).
+    # See apps.staff.views.PinLoginRateThrottle / backend/CLAUDE.md §3.
+    "DEFAULT_THROTTLE_RATES": {
+        "pin_login": "10/min",
+    },
 }

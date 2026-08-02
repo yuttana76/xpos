@@ -1,4 +1,4 @@
-import { getDeviceConfig, getStaffSession } from "./session";
+import { getStaffSession } from "./session";
 
 export class ApiError extends Error {
   status: number;
@@ -12,11 +12,7 @@ async function request<T>(
   path: string,
   options: { method?: string; body?: unknown; auth?: boolean } = {}
 ): Promise<T> {
-  const device = getDeviceConfig();
-  const base =
-    device?.apiBaseUrl ??
-    process.env.NEXT_PUBLIC_API_BASE_URL ??
-    "http://localhost:8010";
+  const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8010";
   const headers: Record<string, string> = { "Content-Type": "application/json" };
 
   if (options.auth !== false) {

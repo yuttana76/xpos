@@ -6,7 +6,7 @@ import { useLiveQuery } from "dexie-react-hooks";
 import { QRCodeSVG } from "qrcode.react";
 import { db } from "@/lib/db";
 import { api, ApiError } from "@/lib/api";
-import { getDeviceConfig, getStaffSession } from "@/lib/session";
+import { getStaffSession, normalizeCustomerOrderBaseUrl } from "@/lib/session";
 import { printAgent } from "@/lib/print";
 import { addItem as addItemAction } from "@/lib/orderActions";
 import { elapsedMinutes } from "@/lib/time";
@@ -112,8 +112,86 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
     ? menuItems.filter((m) => m.name.toLowerCase().includes(menuSearch.trim().toLowerCase()))
     : menuItems;
   const tableName = order?.table ? diningTables.find((t) => t.id === order.table)?.name ?? null : null;
+
+  // แบ่งรายการในออเดอร์ตาม category ของเมนู (เรียงตามลำดับเดียวกับ modal "เลือกเมนู") ให้ดูง่ายขึ้นเมื่อออเดอร์มีหลายหมวด
+  const itemCategoryId = (item: OrderItemRow) => menuItems.find((m) => m.id === item.menu_item)?.category;
+  const orderItemsByCategory = categories
+    .map((cat) => ({ category: cat, items: order?.items.filter((i) => itemCategoryId(i) === cat.id) ?? [] }))
+    .filter((group) => group.items.length > 0);
+  const uncategorizedOrderItems =
+    order?.items.filter((i) => !categories.some((cat) => cat.id === itemCategoryId(i))) ?? [];
+
+  const renderOrderItemRow = (item: OrderDetailResponse["items"][number]) => {
+    const modifiersExtra = item.selected_modifiers.reduce((sum, m) => sum + parseFloat(m.extra_price), 0);
+    const unitPriceWithModifiers = parseFloat(item.unit_price) + modifiersExtra;
+    const lineTotal = unitPriceWithModifiers * item.quantity;
+    return (
+      <div key={item.id} className="flex items-start justify-between p-3 text-sm">
+        <div className="flex items-start gap-2">
+          {order?.status === "OPEN" && (
+            <input
+              type="checkbox"
+              checked={selectedKitchenItemIds.has(item.id)}
+              onChange={() => toggleKitchenItemSelected(item.id)}
+              className="mt-1"
+            />
+          )}
+          <div>
+            <div className="font-medium">
+              {menuItemName(item.menu_item)}{" "}
+              {item.is_takeaway && <span className="text-amber-400 text-xs">[กลับบ้าน]</span>}
+            </div>
+            <div className="text-xs text-slate-500">
+              ฿{unitPriceWithModifiers.toFixed(2)} x {item.quantity} = ฿{lineTotal.toFixed(2)}
+            </div>
+            <div className="text-xs text-slate-500">
+              {item.channel === "CUSTOMER" ? "ลูกค้าสั่งเอง" : "พนักงานสั่งให้"} ·{" "}
+              <span className={KITCHEN_STATUS_COLOR[item.kitchen_status]}>
+                {KITCHEN_STATUS_LABEL[item.kitchen_status]}
+              </span>{" "}
+              ({elapsedMinutes(item.updated_at, now)} นาที)
+            </div>
+            {item.selected_modifiers.length > 0 && (
+              <div className="text-xs text-slate-500">
+                {item.selected_modifiers
+                  .map((m) => modifierOptions.find((o) => o.id === m.modifier_option)?.name ?? m.modifier_option)
+                  .join(", ")}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="flex gap-2 shrink-0">
+          {item.kitchen_status === "SENT" && (
+            <button
+              onClick={() => serveItem(item.id)}
+              className="rounded-md bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20"
+            >
+              เสิร์ฟแล้ว
+            </button>
+          )}
+          {order?.status === "OPEN" && (
+            <button
+              onClick={() => openEditItemModal(item)}
+              className="rounded-md bg-sky-500/10 px-2 py-1 text-xs font-medium text-sky-300 hover:bg-sky-500/20"
+            >
+              แก้ไข
+            </button>
+          )}
+          <button
+            onClick={() => voidItem(item.id)}
+            className="rounded-md bg-rose-500/10 px-2 py-1 text-xs font-medium text-rose-300 hover:bg-rose-500/20"
+          >
+            ลบ
+          </button>
+        </div>
+      </div>
+    );
+  };
   const selfOrderUrl = order?.session_token
-    ? `${(getDeviceConfig()?.customerOrderBaseUrl?.trim() || window.location.origin).replace(/\/$/, "")}/order-session/${order.session_token}`
+    ? `${
+        normalizeCustomerOrderBaseUrl(session?.store.customer_order_base_url ?? "") ??
+        window.location.origin
+      }/order-session/${order.session_token}`
     : null;
 
   const copySelfOrderUrl = async () => {
@@ -515,75 +593,18 @@ export default function OrderDetailPage({ params }: { params: Promise<{ orderId:
       )}
 
       <div className="rounded-lg border border-slate-800 divide-y divide-slate-800">
-        {order.items.map((item) => {
-          const modifiersExtra = item.selected_modifiers.reduce(
-            (sum, m) => sum + parseFloat(m.extra_price),
-            0
-          );
-          const unitPriceWithModifiers = parseFloat(item.unit_price) + modifiersExtra;
-          const lineTotal = unitPriceWithModifiers * item.quantity;
-          return (
-            <div key={item.id} className="flex items-start justify-between p-3 text-sm">
-              <div className="flex items-start gap-2">
-                {order.status === "OPEN" && (
-                  <input
-                    type="checkbox"
-                    checked={selectedKitchenItemIds.has(item.id)}
-                    onChange={() => toggleKitchenItemSelected(item.id)}
-                    className="mt-1"
-                  />
-                )}
-                <div>
-                <div className="font-medium">
-                  {menuItemName(item.menu_item)}{" "}
-                  {item.is_takeaway && <span className="text-amber-400 text-xs">[กลับบ้าน]</span>}
-                </div>
-                <div className="text-xs text-slate-500">
-                  ฿{unitPriceWithModifiers.toFixed(2)} x {item.quantity} = ฿{lineTotal.toFixed(2)}
-                </div>
-                <div className="text-xs text-slate-500">
-                  {item.channel === "CUSTOMER" ? "ลูกค้าสั่งเอง" : "พนักงานสั่งให้"} ·{" "}
-                  <span className={KITCHEN_STATUS_COLOR[item.kitchen_status]}>
-                    {KITCHEN_STATUS_LABEL[item.kitchen_status]}
-                  </span>{" "}
-                  ({elapsedMinutes(item.updated_at, now)} นาที)
-                </div>
-                {item.selected_modifiers.length > 0 && (
-                  <div className="text-xs text-slate-500">
-                    {item.selected_modifiers
-                      .map((m) => modifierOptions.find((o) => o.id === m.modifier_option)?.name ?? m.modifier_option)
-                      .join(", ")}
-                  </div>
-                )}
-                </div>
-              </div>
-              <div className="flex gap-2 shrink-0">
-                {item.kitchen_status === "SENT" && (
-                  <button
-                    onClick={() => serveItem(item.id)}
-                    className="rounded-md bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20"
-                  >
-                    เสิร์ฟแล้ว
-                  </button>
-                )}
-                {order.status === "OPEN" && (
-                  <button
-                    onClick={() => openEditItemModal(item)}
-                    className="rounded-md bg-sky-500/10 px-2 py-1 text-xs font-medium text-sky-300 hover:bg-sky-500/20"
-                  >
-                    แก้ไข
-                  </button>
-                )}
-                <button
-                  onClick={() => voidItem(item.id)}
-                  className="rounded-md bg-rose-500/10 px-2 py-1 text-xs font-medium text-rose-300 hover:bg-rose-500/20"
-                >
-                  ลบ
-                </button>
-              </div>
-            </div>
-          );
-        })}
+        {orderItemsByCategory.map(({ category, items }) => (
+          <div key={category.id}>
+            <div className="bg-slate-950/60 px-3 py-1.5 text-xs font-medium text-slate-400">{category.name}</div>
+            <div className="divide-y divide-slate-800">{items.map(renderOrderItemRow)}</div>
+          </div>
+        ))}
+        {uncategorizedOrderItems.length > 0 && (
+          <div>
+            <div className="bg-slate-950/60 px-3 py-1.5 text-xs font-medium text-slate-400">อื่นๆ</div>
+            <div className="divide-y divide-slate-800">{uncategorizedOrderItems.map(renderOrderItemRow)}</div>
+          </div>
+        )}
         {order.items.length === 0 && (
           <p className="p-3 text-sm text-slate-500">ยังไม่มีรายการ</p>
         )}

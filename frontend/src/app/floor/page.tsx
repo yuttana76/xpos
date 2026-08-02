@@ -49,6 +49,8 @@ interface OpenOrder {
   table: string | null;
   order_type: "DINE_IN" | "TAKEAWAY";
   receipt_number: string;
+  customer_name: string | null;
+  customer_phone: string | null;
   items: OpenOrderItem[];
 }
 
@@ -156,11 +158,11 @@ export default function FloorPage() {
 
   const openNewTable = async (tableId: string) => {
     const device = getDeviceConfig();
-    if (!device) return;
+    if (!device || !session) return;
     setBusyTableId(tableId);
     setNotice(null);
     try {
-      const receiptNumber = await nextReceiptNumber(device.deviceId);
+      const receiptNumber = await nextReceiptNumber(session.store.device_id);
       const response = await openTable(tableId, receiptNumber);
       const { items: _items, ...order } = response as OrderRow & { items?: unknown[] };
       await db.orders.put(order);
@@ -183,6 +185,63 @@ export default function FloorPage() {
     AVAILABLE: "bg-emerald-800 border-emerald-600",
     OCCUPIED: "bg-rose-800 border-rose-600",
     RESERVED: "bg-amber-800 border-amber-600",
+  };
+
+  // แยกโซนแสดงผลตาม order type — โต๊ะกับ takeaway มีข้อมูลที่ต้องโชว์ต่างกัน (โต๊ะใช้ชื่อโต๊ะ, takeaway ใช้ชื่อ/เบอร์ลูกค้า)
+  const activeOrders = openOrders.filter((o) => o.items.length > 0);
+  const dineInOrders = activeOrders.filter((o) => o.order_type !== "TAKEAWAY");
+  const takeawayOrders = activeOrders.filter((o) => o.order_type === "TAKEAWAY");
+
+  const renderOrderCard = (order: OpenOrder) => {
+    const pendingCount = order.items.filter((i) => i.kitchen_status === "PENDING").length;
+    return (
+      <button
+        key={order.id}
+        onClick={() => router.push(`/orders/${order.id}`)}
+        className="text-left rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-sm transition-colors hover:border-slate-700 hover:bg-slate-800/60"
+      >
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-base font-semibold">
+            {order.order_type === "TAKEAWAY" ? "Takeaway" : tableName(order.table) ?? "-"}
+          </span>
+          <div className="flex items-center gap-2">
+            {pendingCount > 0 && (
+              <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+                {pendingCount} รอส่ง
+              </span>
+            )}
+            <span className="text-[11px] font-mono text-slate-500">{order.receipt_number}</span>
+          </div>
+        </div>
+        {order.order_type === "TAKEAWAY" && (order.customer_name || order.customer_phone) && (
+          <div className="mb-2 text-xs text-slate-400 truncate">
+            {[order.customer_name, order.customer_phone].filter(Boolean).join(" · ")}
+          </div>
+        )}
+        <div className="divide-y divide-slate-800/60">
+          {order.items.map((item) => {
+            const minutes = elapsedMinutes(item.updated_at, now);
+            return (
+              <div key={item.id} className="flex items-center justify-between gap-2 py-1.5">
+                <span className="flex items-center gap-2 text-sm text-slate-200 min-w-0">
+                  <span
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${kitchenStatusDotColor(item.kitchen_status, minutes)}`}
+                  />
+                  <span className="truncate">
+                    {menuItemName(item.menu_item)} x{item.quantity}
+                  </span>
+                </span>
+                <span
+                  className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${kitchenStatusPillColor(item.kitchen_status, minutes)}`}
+                >
+                  {KITCHEN_STATUS_LABEL[item.kitchen_status]} · {minutes} น.
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </button>
+    );
   };
 
   return (
@@ -304,7 +363,7 @@ export default function FloorPage() {
         </div>
       ))}
 
-      <div className="space-y-3">
+      <div className="space-y-5">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-medium text-slate-300">สถานะรายการอาหารตามโต๊ะ</h2>
           <div className="flex items-center gap-3 text-[11px] text-slate-500">
@@ -320,60 +379,27 @@ export default function FloorPage() {
           </div>
         </div>
 
-        {openOrders.filter((o) => o.items.length > 0).length === 0 && (
+        {activeOrders.length === 0 && (
           <p className="text-sm text-slate-500">ไม่มีรายการที่กำลังดำเนินการอยู่</p>
         )}
 
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {openOrders
-            .filter((o) => o.items.length > 0)
-            .map((order) => {
-              const pendingCount = order.items.filter((i) => i.kitchen_status === "PENDING").length;
-              return (
-                <button
-                  key={order.id}
-                  onClick={() => router.push(`/orders/${order.id}`)}
-                  className="text-left rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-sm transition-colors hover:border-slate-700 hover:bg-slate-800/60"
-                >
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-base font-semibold">
-                      {order.order_type === "TAKEAWAY" ? "Takeaway" : tableName(order.table) ?? "-"}
-                    </span>
-                    <div className="flex items-center gap-2">
-                      {pendingCount > 0 && (
-                        <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300">
-                          {pendingCount} รอส่ง
-                        </span>
-                      )}
-                      <span className="text-[11px] font-mono text-slate-500">{order.receipt_number}</span>
-                    </div>
-                  </div>
-                  <div className="divide-y divide-slate-800/60">
-                    {order.items.map((item) => {
-                      const minutes = elapsedMinutes(item.updated_at, now);
-                      return (
-                        <div key={item.id} className="flex items-center justify-between gap-2 py-1.5">
-                          <span className="flex items-center gap-2 text-sm text-slate-200 min-w-0">
-                            <span
-                              className={`h-1.5 w-1.5 shrink-0 rounded-full ${kitchenStatusDotColor(item.kitchen_status, minutes)}`}
-                            />
-                            <span className="truncate">
-                              {menuItemName(item.menu_item)} x{item.quantity}
-                            </span>
-                          </span>
-                          <span
-                            className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${kitchenStatusPillColor(item.kitchen_status, minutes)}`}
-                          >
-                            {KITCHEN_STATUS_LABEL[item.kitchen_status]} · {minutes} น.
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </button>
-              );
-            })}
-        </div>
+        {dineInOrders.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="text-xs font-medium text-slate-500">โต๊ะ</h3>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {dineInOrders.map(renderOrderCard)}
+            </div>
+          </div>
+        )}
+
+        {takeawayOrders.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="text-xs font-medium text-slate-500">Takeaway</h3>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {takeawayOrders.map(renderOrderCard)}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

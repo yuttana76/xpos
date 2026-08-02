@@ -1,9 +1,21 @@
 "use client";
 
+import { usePathname } from "next/navigation";
+import { getStaffSession } from "@/lib/session";
 import { useSyncStatus } from "./SyncProvider";
 
+const HIDDEN_ROUTES = new Set(["/", "/login"]);
+
 export function StatusBar() {
+  const pathname = usePathname();
+  const session = getStaffSession();
   const { isOnline, isSyncing, pendingCount, syncNow } = useSyncStatus();
+
+  // แถบ sync/online นี้เป็น chrome เฉพาะตอนพนักงานใช้งานแอปอยู่ — ซ่อนบนหน้าสาธารณะ (landing/login/
+  // self-order) เหมือน Sidebar (component เดียวกัน, กฎเดียวกัน — ดู HIDDEN_ROUTES ใน Sidebar.tsx)
+  if (HIDDEN_ROUTES.has(pathname) || pathname.startsWith("/order-session") || !session) {
+    return null;
+  }
 
   return (
     <div

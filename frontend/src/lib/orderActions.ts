@@ -53,11 +53,11 @@ export async function openTableOffline(tableId: string): Promise<OrderRow> {
   const session = getStaffSession();
   if (!device || !session) throw new Error("ยังไม่ได้ login");
 
-  const receiptNumber = await nextReceiptNumber(device.deviceId);
+  const receiptNumber = await nextReceiptNumber(session.store.device_id);
   const order: OrderRow = {
     id: generateUuid(),
     store: session.store.id,
-    device_id: device.deviceId,
+    device_id: session.store.device_id,
     receipt_number: receiptNumber,
     order_type: "DINE_IN",
     table: tableId,

@@ -2,8 +2,9 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { api, ApiError } from "@/lib/api";
-import { getDeviceConfig, setStaffSession, type StoreSettings } from "@/lib/session";
+import { getDeviceConfig, setDeviceConfig, setStaffSession, type StoreSettings } from "@/lib/session";
 import { useSyncStatus } from "@/components/SyncProvider";
 
 interface LoginResponse {
@@ -14,29 +15,46 @@ interface LoginResponse {
 
 export default function LoginPage() {
   const router = useRouter();
+  const existing = getDeviceConfig();
+  const [editingStore, setEditingStore] = useState(!existing?.storeCode);
+  const [storeCode, setStoreCode] = useState(existing?.storeCode ?? "");
+  const [storeName, setStoreName] = useState<string | null>(null);
   const [pin, setPin] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-
-  const device = getDeviceConfig();
   const { syncNow } = useSyncStatus();
 
+  // เช็คชื่อร้านจาก store_code ให้พนักงานเห็นว่ากำลังจะ login เข้าร้านไหน (กันพิมพ์ผิดรหัสร้าน) —
+  // public endpoint, debounce กันยิงถี่เกินตอนพิมพ์
   useEffect(() => {
-    // อุปกรณ์ที่ตั้งค่าไว้ก่อนหน้านี้ (schema เก่าไม่มี storeCode) ต้องตั้งค่าใหม่
-    if (!device || !device.storeCode) router.replace("/setup");
-  }, [device, router]);
-
-  const submit = async (value: string) => {
-    if (!device || !device.storeCode) {
-      router.replace("/setup");
+    const trimmed = storeCode.trim();
+    if (!trimmed) {
+      setStoreName(null);
       return;
     }
+    const timer = setTimeout(() => {
+      api
+        .get<{ name: string }>(`/api/public/store/${encodeURIComponent(trimmed)}/`, { auth: false })
+        .then((data) => setStoreName(data.name))
+        .catch(() => setStoreName(null));
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [storeCode]);
+
+  const confirmStoreCode = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!storeCode.trim()) return;
+    setDeviceConfig({ storeCode: storeCode.trim() });
+    setEditingStore(false);
+  };
+
+  const submit = async (value: string) => {
     setLoading(true);
     setError(null);
     try {
       const data = await api.post<LoginResponse>(
         "/api/auth/pin-login/",
-        { store_code: device.storeCode, device_id: device.deviceId, pin: value },
+        { store_code: storeCode, pin: value },
         { auth: false }
       );
       setStaffSession({ token: data.token, staff: data.staff, store: data.store });
@@ -57,9 +75,55 @@ export default function LoginPage() {
     if (next.length >= 4) submit(next);
   };
 
+  if (editingStore) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4">
+        <Link
+          href="/"
+          className="self-start text-sm text-slate-400 hover:text-slate-200 sm:self-center sm:-mb-2"
+        >
+          ← กลับหน้าหลัก
+        </Link>
+        <form
+          onSubmit={confirmStoreCode}
+          className="w-full max-w-sm space-y-4 rounded-xl bg-slate-900 p-6 border border-slate-800"
+        >
+          <h1 className="text-lg font-semibold">ตั้งค่าร้าน</h1>
+          <p className="text-sm text-slate-400">ทำครั้งเดียวตอนติดตั้งเครื่องนี้ — ผูก store ที่จะ login เข้าใช้งาน</p>
+
+          <label className="block text-sm">
+            รหัสร้าน (Store Code)
+            <input
+              className="mt-1 w-full rounded bg-slate-800 px-3 py-2"
+              value={storeCode}
+              onChange={(e) => setStoreCode(e.target.value)}
+              placeholder="เช่น XPOS01"
+              autoFocus
+              required
+            />
+            {storeName && <span className="mt-1 block text-xs text-emerald-400">ร้าน: {storeName}</span>}
+          </label>
+
+          <button
+            type="submit"
+            className="w-full rounded bg-sky-600 py-2 font-medium hover:bg-sky-500"
+          >
+            บันทึกและไปหน้า Login
+          </button>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-6 p-4">
-      <h1 className="text-lg font-semibold">เข้าสู่ระบบด้วย PIN</h1>
+      <Link href="/" className="self-start text-sm text-slate-400 hover:text-slate-200 sm:self-center">
+        ← กลับหน้าหลัก
+      </Link>
+      <div className="text-center">
+        <p className="text-sm text-slate-400">{storeName ?? storeCode}</p>
+        <h1 className="text-lg font-semibold">เข้าสู่ระบบด้วย PIN</h1>
+      </div>
       <div className="flex gap-2">
         {Array.from({ length: 6 }).map((_, i) => (
           <span
@@ -82,10 +146,14 @@ export default function LoginPage() {
         ))}
       </div>
       <button
-        onClick={() => router.push("/setup")}
+        onClick={() => {
+          setPin("");
+          setError(null);
+          setEditingStore(true);
+        }}
         className="rounded-md bg-slate-800 px-3 py-1.5 text-xs text-slate-400 hover:bg-slate-700 hover:text-slate-300"
       >
-        เปลี่ยนร้าน / ตั้งค่าอุปกรณ์
+        เปลี่ยนร้าน
       </button>
     </div>
   );

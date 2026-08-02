@@ -1,6 +1,6 @@
 # xPOS — Restaurant POS System — Current State Specification
 
-> **Purpose of this document:** This is a from-the-ground-truth snapshot of what is *actually implemented* in this repository, written for an AI coding agent (Gemini) picking up development. It supersedes `xpost-spec.md` (the original Phase 1 design doc) wherever the two disagree — this file describes what was actually built, including deviations, fixes, and additions made after the original spec was written. Read `xpost-spec.md` first for the original intent/rationale, then use this file as the authoritative reference for current behavior.
+> **Purpose of this document:** This is a from-the-ground-truth snapshot of what is *actually implemented* in this repository, written for an AI coding agent picking up development. The original Phase 1 design doc (`xpost-spec.md`) has been removed from the repo — this file is now the **sole** source of truth for current behavior, including deviations, fixes, and additions made after that original doc was written. Keep this file up to date as the codebase changes; it was last brought back in sync with the code on 2026-07-31 (see §18 for the most recent batch of changes).
 
 ---
 
@@ -11,21 +11,28 @@ A **restaurant POS system**, SaaS-first, **offline-first** on the client. Staff 
 ## 2. Tech stack
 
 - **Backend:** Django + Django REST Framework, PostgreSQL. Custom JWT auth (staff PIN login), not Django's built-in auth/User model.
-- **Frontend:** Next.js (App Router) + React, TypeScript, Tailwind CSS. PWA (manifest + service worker for app-shell caching).
+- **Frontend:** Next.js (App Router) + React, TypeScript, Tailwind CSS. PWA (manifest + service worker for app-shell caching). **Runs as a production build (`Dockerfile.prod`, `next build` + `next start` via standalone output) inside `docker-compose.yml`, not `next dev`** — see §2.1 for why.
 - **Local offline storage:** Dexie.js (IndexedDB wrapper) — mirrors master data + orders on-device.
 - **Local Print Agent:** standalone Node/Express service (`print-agent/`) — bridges the browser to LAN kitchen/receipt printers, since browsers can't open raw TCP sockets.
-- **Containerization:** Docker Compose (`db`, `backend`, `frontend`, `nginx`).
+- **Containerization:** Docker Compose (`db`, `backend`, `frontend`, `nginx`, `redis`, `celery-worker`, `celery-beat` — see §17).
 
 Repo layout:
 ```
 backend/          Django project (config/ + apps/)
 frontend/         Next.js app (src/app/, src/lib/, src/components/)
 print-agent/      Standalone Node print bridge (NOT in docker-compose; run separately)
-nginx/            Reverse proxy config (prod)
+nginx/            Reverse proxy config (dev.conf for docker-compose.yml, templates/ for prod)
 docker-compose.yml / docker-compose.prod.yml
-xpost-spec.md              Original Phase 1 design doc (historical intent)
-spec-xpost-gemini.md       This file (current-state reference)
+spec-xpost.md              This file (current-state reference — the only spec doc in the repo)
 ```
+
+### 2.1 Frontend runs as a production build, even in `docker-compose.yml`
+
+`frontend/Dockerfile` (`npm run dev`, hot-reload) is **no longer used by `docker-compose.yml`**. The `frontend` service there now builds from `frontend/Dockerfile.prod` (multi-stage: `npm run build` → Next.js standalone output → `node server.js`), the same Dockerfile `docker-compose.prod.yml` was already using for the cloud deployment.
+
+**Why:** `docker-compose.yml` is the *store* LAN deployment (§17) — customers' own phones load `/order-session/[token]` over the store's WiFi through nginx, on a different origin (`http://<LAN-IP>:8080`) than `localhost`. Next.js dev mode's webpack-HMR client tries to hold a WebSocket open back to the dev server (`/_next/webpack-hmr`); when reached from a phone over a LAN IP through the nginx proxy that connection fails and retries in a tight loop, which was observed to prevent the page's own `useEffect`-driven data fetch from ever completing (page stuck on a loading spinner indefinitely, no error, nothing in the Network tab) even though the exact same API call worked fine when issued manually from the browser console. Switching to a production build removes HMR entirely and fixed it outright.
+
+**Consequence:** editing any frontend file now requires `docker compose up -d --build frontend` to see the change — there is no hot-reload in this deployment mode anymore. `NEXT_PUBLIC_API_BASE_URL` is passed as a Docker build **arg** (baked into the client JS bundle at build time, per Next.js's `NEXT_PUBLIC_*` convention), not a runtime env var — changing it also requires a rebuild, not just a container restart.
 
 Backend apps: `tenancy`, `staff`, `floor`, `menu`, `orders`, `sync`, `audit`, `common`.
 
@@ -54,11 +61,16 @@ Backend apps: `tenancy`, `staff`, `floor`, `menu`, `orders`, `sync`, `audit`, `c
 ### `apps/tenancy/models.py` — `Store`
 ```python
 id, store_code (unique, short human code e.g. "XPOS01"),
-name, tax_id (nullable), address (nullable),
+name, device_id (default "POS01"), tax_id (nullable), address (nullable),
+customer_order_base_url (nullable URLField),
 vat_rate (default 7.00), service_charge_rate (default 0.00),
-is_active, updated_at
+sync_key_hash (nullable — see §17.4), is_active, updated_at
 ```
-**Delta from original spec:** added `store_code` (see §6), `address` (added for Thai receipt compliance, §11).
+**Delta from original spec:** added `store_code` (see §6), `address` (added for Thai receipt compliance, §12), `sync_key_hash` (§17.4).
+
+**Recent additions (2026-07-31), both configured via Django admin only, no frontend UI to set them:**
+- **`device_id`** (`CharField`, default `"POS01"`) — the POS receipt-number prefix, moved here from a per-device `localStorage` setting (see §6). **Assumes exactly one POS device per store** — the help text on the field says so explicitly. If a store ever runs two physical POS terminals simultaneously, this field as designed will make both terminals issue receipt numbers with the *same* prefix, defeating the whole point of rule #3 (per-device receipt prefixing to avoid collisions). Revisit before allowing multi-device stores.
+- **`customer_order_base_url`** (`URLField`, nullable) — the base URL a customer's phone should hit when scanning a self-order QR code (e.g. `http://192.168.9.13:8080`), moved here from a per-device `localStorage` setting for the same reason `device_id` was (a store-level fact, not a device-level one). If blank, QR generation falls back to `window.location.origin` (the staff device's own current URL) — see §11.
 
 ### `apps/staff/models.py` — `Staff`
 ```python
@@ -80,11 +92,12 @@ is_active, updated_at
 
 ## 5. Authentication
 
-- **Login is PIN + `store_code`**, not username/password. `POST /api/auth/pin-login/` body: `{store_code, device_id, pin}`.
+- **Login is PIN + `store_code`**, not username/password. `POST /api/auth/pin-login/` body: `{store_code, pin}` — **no `device_id` in the request** (see below, changed 2026-07-31).
   - Looks up `Store` by `store_code`, then scans that store's active `Staff` checking `pin_code_hash` via `django.contrib.auth.hashers.check_password`.
-  - Returns `{token, staff: {id, name, role}, store: {id, name, vat_rate, service_charge_rate, tax_id, address}}`.
-- JWT payload: `{staff_id, store_id, device_id, role, iat, exp}` (12h TTL). `store_id` here is the UUID — **this is the only store_id the rest of the API ever trusts**, regardless of what `store_code` was used to log in.
+  - Returns `{token, staff: {id, name, role}, store: {id, name, device_id, vat_rate, service_charge_rate, tax_id, address, customer_order_base_url}}`.
+- JWT payload: `{staff_id, store_id, device_id, role, iat, exp}` (12h TTL). `store_id` here is the UUID — **this is the only store_id the rest of the API ever trusts**, regardless of what `store_code` was used to log in. `device_id` is **derived server-side from `Store.device_id`** (§4), never trusted from the client — `PinLoginView` used to accept a client-supplied `device_id` in the request body and pass it straight into the JWT unvalidated; that was removed as part of moving `device_id` to a Store-level backend field (single-POS-device-per-store).
 - `apps/common/authentication.py::StaffJWTAuthentication` decodes the token, re-fetches the live `Staff` row (`is_active=True`, matching `store_id`) on every request — a deactivated staff member is locked out immediately, no waiting for token expiry.
+- **`PinLoginView` is rate-limited** (added 2026-07-31): `apps.staff.views.PinLoginRateThrottle` (DRF `AnonRateThrottle`, scope `pin_login`, `10/min` per IP — see `REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]`). Backed by a Redis `CACHES["default"]` (DB 1, separate from Celery's DB 0 — `DJANGO_CACHE_URL`, default `redis://redis:6379/1`), not Django's default per-process cache, so the limit holds across multiple backend worker processes. PINs are low-entropy (4 digits in `seed_demo`) and this endpoint has no authentication at all, so it was a real brute-force gap before this.
 - Permissions (`apps/common/permissions.py`):
   - `IsOwnerOrManager` — role in (OWNER, MANAGER)
   - `IsOwner` — role == OWNER only
@@ -94,10 +107,21 @@ is_active, updated_at
 
 ## 6. Store identification: `store_code` vs `store_id`
 
-Originally devices were configured with the Store's raw UUID (`storeId` in `DeviceConfig`). This was replaced with a short, human-typeable `store_code` (e.g. `XPOS01`) because staff were mistyping/pasting the wrong values on `/setup`. **Current flow:**
-- `/setup` page collects `apiBaseUrl`, `storeCode`, `deviceId` → stored in `localStorage` under `xpos.device` (see `frontend/src/lib/session.ts`).
-- `pin-login` request body uses `store_code`, not `store_id`.
-- Devices configured under the *old* schema (`storeId` field, no `storeCode`) are detected on `/login` (`!device.storeCode`) and bounced to `/setup` automatically.
+Originally devices were configured with the Store's raw UUID (`storeId` in `DeviceConfig`). This was replaced with a short, human-typeable `store_code` (e.g. `XPOS01`) because staff were mistyping/pasting the wrong values.
+
+### 6.1 `/setup` no longer exists — merged into `/login` (2026-07-31)
+
+There used to be a separate `/setup` route collecting `apiBaseUrl`, `storeCode`, `deviceId`. All three of those were removed from client-side config one at a time and the route was deleted entirely once nothing was left for it to configure:
+
+- **`apiBaseUrl`** — removed first. `frontend/src/lib/api.ts` now reads **only** `process.env.NEXT_PUBLIC_API_BASE_URL` (build-time env var, falls back to `http://localhost:8010` if unset) — never a per-device override. See §2.1 for why this is a *build* arg, not a runtime setting.
+- **`deviceId`** — moved to `Store.device_id` on the backend (§4), fetched from the pin-login response instead of typed in locally.
+- **`storeCode`** — the only field left. It's now entered directly on `/login` instead of a separate page: `frontend/src/app/login/page.tsx` shows a store-code form first if none is saved yet (`getDeviceConfig()?.storeCode` is falsy), otherwise it goes straight to the PIN pad. There's a "เปลี่ยนร้าน" button on the PIN pad that flips a local `editingStore` state back to the store-code form **in place** — no route navigation, no `/setup` page exists to navigate to. `DeviceConfig` (`frontend/src/lib/session.ts`) is now just `{ storeCode: string }`.
+- The old *old*-schema-detection redirect (`!device.storeCode` → bounce to `/setup`) is gone along with the route; `/login` handles "no store configured yet" as its own first-render state instead of redirecting anywhere.
+- Root `page.tsx` redirect logic simplified accordingly: `getStaffSession() ? "/floor" : "/login"` (previously a three-way check involving `getDeviceConfig()` too).
+
+### 6.2 Store-name lookup before login
+
+New public endpoint, `GET /api/public/store/<store_code>/` (`apps/tenancy/views.py::StoreLookupView`, `AllowAny`) — returns `{name, store_code}` only (no `tax_id`/`address`/`device_id`/etc., since this is reachable pre-login by anyone who can reach the API and guess/know a `store_code`). `/login` calls this with a 400ms debounce as the staff types the store code, showing "ร้าน: {name}" so a mistyped store code is caught before it's saved — and shows the resolved name again above the PIN pad, so staff can visually confirm which store they're about to log into.
 
 ---
 
@@ -136,6 +160,9 @@ All paths are under the Django root; see `config/urls.py` for the mount points.
 - `POST <session_token>/items/`
 
 (Both `AllowAny`, validate token liveness + Order/Table status per original spec §"Self-Order Flow".)
+
+### Public store lookup — `apps.tenancy` (`/api/public/store/`) — **new 2026-07-31**
+- `GET <store_code>/` — `AllowAny`, returns `{name, store_code}` only. Used by `/login` to show the store name before/while entering a PIN (§6.2). 404 if the store doesn't exist or `is_active=False`.
 
 ### Floor management — `apps.floor` (`/api/floor/`) — **new since original spec**
 DRF `DefaultRouter`-backed CRUD, `IsOwner` only:
@@ -186,16 +213,26 @@ When aggregating with a `filter=Q(...)` on `Sum`/`Count` (used for "show every X
 ### 8.7 Menu-item `version` field
 Bumped by 1 on every `MenuItemViewSet` update (`perform_update`), for future client-side cache-busting. Not currently read by any frontend code, but keep bumping it — don't remove.
 
+### 8.8 `OrderItemAdmin` search + table column (2026-07-31)
+`apps/orders/admin.py::OrderItemAdmin` gained `search_fields = ("order__receipt_number",)` (previously had none at all — no way to find an item by receipt number in `/admin/orders/orderitem/`) and a computed `order_table` column (`obj.order.table`, sortable via `ordering="order__table__name"`) plus `list_select_related = ("order", "order__table")` to avoid N+1 queries on the list view.
+
 ---
 
 ## 9. Frontend structure
 
 ### Routes (`frontend/src/app/`)
 ```
-/                          → redirect logic (device? session? → /setup | /login | /floor)
-/setup                     → device config (apiBaseUrl, storeCode, deviceId) → localStorage
-/login                     → PIN pad; also has a "เปลี่ยนร้าน / ตั้งค่าอุปกรณ์" link → /setup
-/floor                     → table grid + kitchen-status panel + revenue summary tiles (role-aware)
+/                          → public one-page landing (Home/Service/Contact sections, anchor-
+                             scroll nav, "เข้าสู่ระบบ" → /login) — added 2026-07-31, see below.
+                             Logged-in staff (valid session) get redirected to /floor via a
+                             background effect; content renders immediately either way (not
+                             gated behind the check) since this is a public, crawlable page.
+/login                     → store-code entry (first run) + PIN pad, one page, no /setup route
+                             anymore — see §6.1. "เปลี่ยนร้าน" toggles back to the store-code
+                             form in place (no navigation).
+/floor                     → table grid + kitchen-status panel (split into "โต๊ะ"/"Takeaway"
+                             sections, Takeaway cards show customer_name/customer_phone when
+                             present — added 2026-07-31) + revenue summary tiles (role-aware)
 /takeaway/new              → new takeaway order form
 /orders/[orderId]          → the core order-taking screen (add/edit items, modifiers, discount,
                              send-to-kitchen, pay, cancel) — see §11
@@ -215,16 +252,18 @@ Bumped by 1 on every `MenuItemViewSet` update (`perform_update`), for future cli
 ```
 
 ### Session/device state (`frontend/src/lib/session.ts`)
-`localStorage` keys `xpos.device` (`DeviceConfig`: `apiBaseUrl, storeCode, deviceId`) and `xpos.session` (`StaffSession`: `token, staff {id,name,role}, store {id,name,vat_rate,service_charge_rate,tax_id,address}`). No cookies, no server sessions — everything is the JWT in `xpos.session` sent as `Authorization: Bearer`.
+`localStorage` keys `xpos.device` (`DeviceConfig`: **just `{storeCode}`** as of 2026-07-31 — `apiBaseUrl` and `deviceId` were removed, see §6.1/§4) and `xpos.session` (`StaffSession`: `token, staff {id,name,role}, store {id, name, device_id, vat_rate, service_charge_rate, tax_id, address, customer_order_base_url}`). No cookies, no server sessions — everything is the JWT in `xpos.session` sent as `Authorization: Bearer`.
+
+Also exports `normalizeCustomerOrderBaseUrl(raw: string): string | null` — trims, auto-prepends `http://` if the scheme is missing, validates via `new URL()`, returns `null` for blank/invalid input. Used both when building the self-order QR link (`orders/[orderId]/page.tsx`, reads `session.store.customer_order_base_url`) and as a defensive normalizer in case a Store's `customer_order_base_url` was saved via admin without a scheme.
 
 ### `frontend/src/lib/api.ts`
-Thin fetch wrapper: `api.get/post/patch/del`. Throws `ApiError` (with `.status`) on non-2xx. Base URL comes from `device.apiBaseUrl`.
+Thin fetch wrapper: `api.get/post/patch/del`. Throws `ApiError` (with `.status`) on non-2xx. Base URL comes **only** from `process.env.NEXT_PUBLIC_API_BASE_URL` (see §2.1/§6.1 — no more per-device override).
 
 ### Dexie schema (`frontend/src/lib/db.ts`)
 Mirrors master data + orders. See file for the full table list — unchanged in shape from original spec's intent, just confirmed accurate as of this writing (§4 above lists the source-of-truth Django models; Dexie interfaces mirror them field-for-field).
 
 ### `frontend/src/components/Sidebar.tsx`
-Persistent left nav (desktop: static column; mobile: hamburger + slide-over drawer with backdrop). Role-filtered nav items. Contains an **expandable "รายงาน" sub-menu** (auto-expands if the current route is a report sub-page), grouped by category (ยอดขาย / ตรวจสอบ / ภาษี) matching the `/reports` hub categorization. Hidden entirely on `/`, `/login`, `/setup`, `/order-session/*`.
+Persistent left nav (desktop: static column; mobile: hamburger + slide-over drawer with backdrop). Role-filtered nav items. Contains an **expandable "รายงาน" sub-menu** (auto-expands if the current route is a report sub-page), grouped by category (ยอดขาย / ตรวจสอบ / ภาษี) matching the `/reports` hub categorization. Hidden entirely on `/`, `/login`, `/order-session/*`.
 
 ### `frontend/src/components/DateRangePicker.tsx`
 Shared by every `/reports/*` sub-page except `/reports/today` (which is always "today" specifically). Quick presets (วันนี้/สัปดาห์นี้/เดือนนี้) + manual `<input type="date">` from/to.
@@ -248,9 +287,11 @@ Deliberately **did not** touch JWT/auth scoping (still one store per session, pe
 
 This is the most feature-dense page; a lot of iteration happened here.
 
+- **Order item list:** grouped by menu category (same category order as the "Add item" picker below), with items whose category can't be resolved (e.g. category was deleted) bucketed under "อื่นๆ" at the end — added 2026-07-31, previously a flat list. Checkbox-select/edit/void/serve behavior per item is unchanged.
 - **Add item modal:** quantity stepper + per-`ModifierGroup` **single-select (radio)** options (not checkboxes — a deliberate correction from an earlier multi-select version), required groups block confirmation until satisfied. Shows a **live-updating unit-price × qty = total** preview as you adjust quantity/modifiers.
 - **Edit item:** re-opens the same modal pre-filled. If quantity/modifiers are unchanged but `kitchen_status` is changed via the dropdown, it's applied **in place** (`.../kitchen-status/` endpoint, no re-creation). If content *did* change, the old item is voided and a new one created (existing immutable-line-item architecture) — the new item always starts at PENDING regardless of what the status dropdown said, since changed content genuinely needs re-cooking.
 - **Send to kitchen:** single button, always enabled once the order has any item. Prints **all current items grouped by menu category** (not just newly-added ones) to that category's assigned `KitchenPrinter` (or "N/A" if unset), then marks any still-PENDING items SENT. If nothing is PENDING when pressed, it **reprints** everything already sent instead (ticket header gets a "(พิมพ์ซ้ำ)" suffix) — one button covers both send and reprint, no separate reprint UI.
+- **"แสดง QR ให้ลูกค้าสั่งเอง" button** (dine-in orders only, requires a `session_token`): opens a modal with a `QRCodeSVG` encoding `{customer_order_base_url or window.location.origin}/order-session/{session_token}` (§6.2/§4 for where that base URL comes from), a copyable raw link, a "พิมพ์ (เบราว์เซอร์)" button, and a print-to-kitchen-printer option. Copy/share both target the same computed URL.
 - **Discount:** flat-amount or percentage toggle (฿/%), **applies live as you type** (600ms debounce), no separate "apply" button. Percentage is converted to currency client-side from current subtotal before hitting `/discount/`. On page load, syncs the input from the order's actual stored discount once (a ref guards against the debounce effect clobbering it back to the initial "0").
 - **Payment:** confirm modal shows the full breakdown before charging; on confirm, prints a receipt immediately (no forced preview — see product rationale in §"design notes" below) meeting Thai tax-invoice requirements (see §12.1... err, §16).
 - **Missing-order handling:** every mutating action (pay/cancel/void/etc.) checks for a 404 (`ApiError.status === 404`) specifically and, if hit, clears the stale local Dexie copy and shows a dedicated "ไม่พบออเดอร์นี้บน server แล้ว" screen with a button back to `/floor` — instead of a generic error the user can't escape. This matters because orders *can* legitimately vanish from a client's perspective (e.g. cancelled from another device) faster than the 5s poll notices.
@@ -294,18 +335,22 @@ Carried over from the original spec's Phase 2 table (still not done): Split paym
 - `AuditLog` actions `TABLE_STATUS_OVERRIDE`, `MENU_PRICE_CHANGED`, `MASTER_DATA_DEACTIVATED`, `SESSION_TOKEN_REJECTED`, `SYNC_CONFLICT_RESOLVED`, `SYNC_IDEMPOTENT_REJECT` are defined but never written — if you need audit coverage for those events, you must add the `AuditLog.objects.create(...)` calls at the relevant call sites.
 - `ModifierGroup` has no "max selections" DB constraint — single-select is a frontend convention only; a direct API call could still attach multiple `OrderItemModifier` rows to one item.
 - Weekly/monthly aggregate reports use the same generic date-range report (`/reports/sales`) rather than dedicated week/month views — this was judged sufficient rather than building separate endpoints.
-- No automated test coverage was added for the new `/api/orders/reports/*` endpoints or the `/api/floor/`, `/api/menu/` CRUD endpoints (only manually verified via curl + Playwright browser sessions during development). The existing Django test suite (`apps/orders/tests.py`, 11 tests) still passes but does not cover this new surface area.
+- No automated test coverage was added for the new `/api/orders/reports/*` endpoints or the `/api/floor/`, `/api/menu/` CRUD endpoints (only manually verified via curl + Playwright browser sessions during development). The Django test suite (17 tests across `apps/orders/tests.py` and `apps/sync/tests.py` — see §16) still passes but does not cover this new surface area.
 - `print-agent` has no auto-restart/watch mode — see §9 warning.
+- **`Store.device_id` and `Store.customer_order_base_url` (§4) both assume exactly one POS device per store.** If a store ever needs two+ simultaneous terminals, `device_id` as currently designed will make both terminals share the same receipt-number prefix (collision risk, defeats rule #3) — this needs a real per-device identity scheme again (e.g. a device-registration flow) before that's safe, not just reverting the `/setup` field.
+- No new automated tests were added for `StoreLookupView` (§6.2), the `PinLoginView` `device_id`-derivation change, or the `PinLoginRateThrottle` addition (§5) — only manually curl-verified during development (throttle behavior specifically: hammered the endpoint past the limit, confirmed 429 + `Retry-After`, confirmed the throttle key actually lands in Redis DB 1, confirmed a legit login succeeds again once the window is cleared).
 
 ---
 
 ## 16. If you're picking this up cold
 
-1. `docker compose up -d` brings up db/backend/frontend/nginx. `print-agent/` is separate: `cd print-agent && node server.js` (optionally `ENABLE_REAL_PRINTING=true`).
-2. Seed data: `python manage.py seed_demo` (inside the backend container) creates a demo store with `store_code=XPOS01`, an owner (PIN `1111`) and server (PIN `2222`).
-3. To test as an Owner with multiple stores, create a second `Store` + `Staff`, then add it to the first owner's `additional_stores` via Django admin.
-4. Backend tests: `python manage.py test` (fast, ~2s, 11 tests — all in `apps/orders/tests.py`).
-5. When adding any new synced master-data model or endpoint: inherit `SoftDeleteModelViewSet`, scope via JWT `store_id` (never trust client-supplied store IDs), and if you ever bulk-`.update()` rows that matter to sync, remember to bump `updated_at` explicitly (§8.4).
+1. `docker compose up -d --build` brings up db/backend/frontend/nginx/redis/celery-worker/celery-beat. **The `--build` matters** — the frontend is a production build now (§2.1), so plain `up -d` after a code change will silently keep serving the stale image. `print-agent/` is separate: `cd print-agent && node server.js` (optionally `ENABLE_REAL_PRINTING=true`).
+2. Seed data: `python manage.py seed_demo` (inside the backend container) creates a demo store with `store_code=XPOS01`, `device_id=POS01` (model default, §4), an owner (PIN `1111`) and server (PIN `2222`).
+3. First run on a fresh browser: go straight to `/login` (no `/setup` anymore, §6.1) — enter the store code once, then the PIN pad. `device_id` and the self-order QR base URL are **not** entered anywhere in the UI — set `Store.device_id` / `Store.customer_order_base_url` via Django admin if the defaults (`POS01`, blank) aren't right for the deployment.
+4. To test as an Owner with multiple stores, create a second `Store` + `Staff`, then add it to the first owner's `additional_stores` via Django admin.
+5. Backend tests: `python manage.py test` (fast, ~4s, 17 tests across `apps/orders/tests.py` and `apps/sync/tests.py`).
+6. When adding any new synced master-data model or endpoint: inherit `SoftDeleteModelViewSet`, scope via JWT `store_id` (never trust client-supplied store IDs), and if you ever bulk-`.update()` rows that matter to sync, remember to bump `updated_at` explicitly (§8.4).
+7. Frontend type-check before rebuilding: `cd frontend && npx tsc --noEmit` (fast; the Docker build itself also runs a full `next build`, which is a stricter/slower check — a clean `tsc` doesn't guarantee a clean `next build`, e.g. it won't catch stale generated `.next/dev/types` if you deleted a route — delete `frontend/.next` locally if `tsc` complains about a route file that no longer exists).
 
 ---
 
@@ -433,3 +478,21 @@ added purely through the store's local API → a second `sync_now` pushed it →
 appeared in the cloud's DB with correct recalculated totals (VAT/service charge intact
 per rule #12). `celery-worker`/`celery-beat` boot cleanly and register the task; the
 task no-ops cleanly on the cloud deployment where `CLOUD_SYNC_KEY` is blank.
+
+---
+
+## 18. Changelog — 2026-07-31 batch
+
+Everything below was implemented and verified in one working session; **as of this writing it is uncommitted on `main`** (`git status` shows it all as unstaged/untracked — commit when ready, this doc doesn't do that for you). Listed here as a single reference point since it touches several sections above.
+
+1. **Fixed a real QR self-order bug** (§2.1): `docker-compose.yml`'s `frontend` service switched from `Dockerfile` (dev/HMR) to `Dockerfile.prod` (production build) — root-caused a customer's phone getting stuck on "กำลังโหลดเมนู..." forever with no console error, traced to the dev-mode HMR websocket failing over a LAN-IP+nginx origin and apparently blocking the page's own data fetch from ever completing.
+2. **`Store.customer_order_base_url`** added (§4) — self-order QR base URL moved from a per-device `localStorage` setting to a Store-level backend field, admin-configured.
+3. **`Store.device_id`** added (§4, §5) — receipt-number device prefix moved the same way; `PinLoginView` no longer trusts a client-supplied `device_id`, derives it from `Store.device_id` server-side instead. **Known limitation:** single-device-per-store only (§15).
+4. **`/setup` route deleted, merged into `/login`** (§6.1) — the only thing left to configure client-side is `storeCode`; `apiBaseUrl` is now env-only (§2.1), `deviceId` is backend-only (§4).
+5. **New public endpoint** `GET /api/public/store/<store_code>/` (§6.2, §7) — store-name lookup, used by `/login` to show which store you're about to log into.
+6. **`OrderItemAdmin`** (§8.8) gained `search_fields` (by receipt number) and a `order_table` column — previously had neither.
+7. **Order item list on `/orders/[orderId]`** (§11) now grouped by menu category, matching the "Add item" picker's grouping — was a flat list before.
+8. **`/floor` kitchen-status panel** now split into "โต๊ะ" and "Takeaway" sections; Takeaway cards show `customer_name`/`customer_phone` when present — previously one mixed grid with no customer info shown at all.
+9. **Added `CLAUDE.md` rule files** (root, `backend/`, `frontend/`) codifying framework-specific do's/don'ts for AI agents working on this repo, grounded in the official Next.js and Django docs plus every gotcha already documented in this spec.
+10. **`PinLoginView` rate-limited** (§5) — found and fixed during a framework-best-practices audit prompted by writing the `CLAUDE.md` files above: the PIN-login endpoint had zero brute-force protection despite 4-digit PINs and `AllowAny`. Added a Redis-backed DRF throttle (`10/min` per IP) — first real infrastructure dependency the Django app has on Redis beyond Celery (new `CACHES` setting, DB 1).
+11. **`/` replaced with a real public landing page** (§9) — previously an invisible client-side redirect (`/login` or `/floor` depending on session), now a one-page site (Home/Service/Contact sections, sticky nav with anchor-scroll links, "เข้าสู่ระบบ" → `/login`). Content renders in the server-rendered HTML unconditionally (verified via `curl` — a first pass gated the whole page behind a client-only session check, which meant `curl`/no-JS/search-engine visitors saw only a loading spinner; fixed to render immediately and redirect already-logged-in staff to `/floor` in the background instead). `StatusBar` (`frontend/src/components/StatusBar.tsx`) — previously rendered unconditionally on every route — now hides on `/`, `/login`, and `/order-session/*` the same way `Sidebar` already did, since the online/sync status bar is staff-only chrome that has no place on a public page. `<html>` gained Tailwind's `scroll-smooth` class (`layout.tsx`) for the anchor-scroll nav; each section has `scroll-mt-*` so the sticky header doesn't cover the scrolled-to content. Contact section uses **placeholder** email/phone/address — swap for real details before this goes live.

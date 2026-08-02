@@ -60,16 +60,15 @@ services:
     command: celery -A config beat -l info
 
   frontend:
-    build: ./frontend
-    environment:
-      # ค่า default ใช้ได้เฉพาะตอนพนักงาน+ลูกค้าเปิดจากเครื่องเดียวกัน (localhost) — ถ้าต้องการให้ลูกค้า
-      # สแกน QR สั่งอาหารเองจากมือถือ ต้องตั้งเป็น LAN IP ของเครื่องนี้ใน .env เช่น
-      # NEXT_PUBLIC_API_BASE_URL=http://192.168.1.48:8080 (ดู README หัวข้อ "QR สั่งอาหารเองผ่าน LAN")
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        # ค่า default ใช้ได้เฉพาะตอนพนักงาน+ลูกค้าเปิดจากเครื่องเดียวกัน (localhost) — ถ้าต้องการให้ลูกค้า
+        # สแกน QR สั่งอาหารเองจากมือถือ ต้องตั้งเป็น LAN IP ของเครื่องนี้ใน .env เช่น
+        # NEXT_PUBLIC_API_BASE_URL=http://192.168.1.48:8080 (ดู README หัวข้อ "QR สั่งอาหารเองผ่าน LAN")
+        # เป็น production build (ไม่มี dev-mode HMR) จึงต้องรีบิลด์ทุกครั้งที่แก้โค้ด frontend หรือเปลี่ยนค่านี้
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
     ports:
       - "3000:3000"
     depends_on:
