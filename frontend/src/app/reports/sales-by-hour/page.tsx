@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import { getStaffSession } from "@/lib/session";
 import { DateRangePicker, todayRange, type DateRange } from "@/components/DateRangePicker";
+import { DailyRevenueChart } from "@/components/DailyRevenueChart";
 
 interface HourRow {
   hour: number;
@@ -55,6 +56,9 @@ export default function SalesByHourReportPage() {
       <DateRangePicker value={range} onChange={setRange} />
 
       {notice && <p className="text-sm text-rose-400">{notice}</p>}
+
+      <DailyRevenueChart from={range.from} to={range.to} />
+
       {data && activeHours.length === 0 && <p className="text-sm text-slate-500">ไม่มีข้อมูลในช่วงนี้</p>}
 
       {data && activeHours.length > 0 && (

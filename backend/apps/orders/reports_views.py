@@ -2,7 +2,7 @@ from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum, Value
-from django.db.models.functions import Coalesce, ExtractHour
+from django.db.models.functions import Coalesce, ExtractHour, TruncDate
 from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -92,6 +92,54 @@ class SalesReportView(APIView):
                 "by_store": by_store,
             }
         )
+
+
+class DailySalesReportView(APIView):
+    """GET /api/orders/reports/daily-sales/ — ยอดขายรายวัน สำหรับ line chart ที่ใช้ร่วมกันในหน้า
+    รายงานต่างๆ (สรุปยอดขาย, ขายดี/ขายไม่ดีตามเมนู, ยอดขายตามเวลา, ยอดขายตามพนักงาน) — รวมทุกร้านที่
+    accessible เข้าด้วยกัน ไม่แยกรายร้าน (ตาม pattern เดียวกับ sales-by-hour/sales-by-staff, ต่างจาก
+    sales/ ที่มี by_store เพราะ endpoint นั้นมีมาก่อนและหน้านั้นเดียวที่ต้องแยกรายร้าน)
+
+    zero-fill ทุกวันในช่วงที่เลือกเหมือน sales-by-hour zero-fill ทุกชั่วโมง — เพื่อให้เส้นกราฟต่อเนื่อง
+    ไม่ขาดหายวันที่ไม่มียอดขาย
+    """
+
+    permission_classes = [IsOwnerOrManager]
+    MAX_DAYS = 366  # กันช่วงวันที่กว้างเกินไปโดยไม่ตั้งใจทำให้ loop zero-fill ด้านล่างช้า/ค้าง
+
+    def get(self, request):
+        date_from, date_to = _parse_date_range(request)
+        if (date_to - date_from).days > self.MAX_DAYS:
+            date_from = date_to - timedelta(days=self.MAX_DAYS)
+        store_ids = _store_ids(request)
+
+        rows = (
+            Order.objects.filter(
+                store_id__in=store_ids,
+                status=Order.OrderStatus.PAID,
+                updated_at__date__gte=date_from,
+                updated_at__date__lte=date_to,
+            )
+            .annotate(day=TruncDate("updated_at"))
+            .values("day")
+            .annotate(total_revenue=Sum("total_amount"), order_count=Count("id"))
+        )
+        by_day = {r["day"]: r for r in rows}
+
+        results = []
+        current = date_from
+        while current <= date_to:
+            r = by_day.get(current)
+            results.append(
+                {
+                    "date": current.isoformat(),
+                    "total_revenue": str(r["total_revenue"]) if r else "0.00",
+                    "order_count": r["order_count"] if r else 0,
+                }
+            )
+            current += timedelta(days=1)
+
+        return Response({"from": date_from.isoformat(), "to": date_to.isoformat(), "days": results})
 
 
 class MenuPerformanceReportView(APIView):
@@ -202,6 +250,85 @@ class SalesByStaffReportView(APIView):
             for r in rows
         ]
         return Response({"from": date_from.isoformat(), "to": date_to.isoformat(), "staff": results})
+
+
+class DailySalesByStaffReportView(APIView):
+    """GET /api/orders/reports/daily-sales-by-staff/ — ยอดขายรายวัน แยกเป็นเส้นต่อพนักงานที่รับชำระเงิน
+    สำหรับ line chart หน้า /reports/sales-by-staff โดยเฉพาะ (ต่างจาก daily-sales/ ที่รวมยอดเดียว)
+
+    ต่างจาก sales-by-staff/ (ตาราง) ตรงที่ chart นี้ **ไม่รวมพนักงานที่ไม่มียอดขายเลยในช่วงนี้** — เส้น
+    แบนที่ 0 ตลอดทั้งช่วงไม่มีประโยชน์บนกราฟและจะทำให้ legend รกโดยไม่จำเป็น (พนักงานยอด 0 ยังเห็นได้จาก
+    ตารางสรุปด้านล่างของหน้าเดิมอยู่แล้ว) และ **จำกัดไม่เกิน 8 เส้น** (เอาเฉพาะ top 7 ตามยอดขายรวม ที่เหลือ
+    รวมเป็นเส้น "อื่นๆ") ตาม categorical palette cap ของ dataviz skill — เกิน 8 เส้นแยกสีไม่ออกแล้ว
+    """
+
+    permission_classes = [IsOwnerOrManager]
+    MAX_DAYS = 366
+    MAX_SERIES = 8  # รวม "อื่นๆ" ด้วย ตาม categorical palette cap (8 slot ที่ผ่าน adjacent-pair CVD check)
+
+    def get(self, request):
+        date_from, date_to = _parse_date_range(request)
+        if (date_to - date_from).days > self.MAX_DAYS:
+            date_from = date_to - timedelta(days=self.MAX_DAYS)
+        store_ids = _store_ids(request)
+
+        rows = (
+            Order.objects.filter(
+                store_id__in=store_ids,
+                status=Order.OrderStatus.PAID,
+                paid_by__isnull=False,
+                updated_at__date__gte=date_from,
+                updated_at__date__lte=date_to,
+            )
+            .annotate(day=TruncDate("updated_at"))
+            .values("paid_by_id", "paid_by__name", "day")
+            .annotate(total_revenue=Sum("total_amount"), order_count=Count("id"))
+        )
+
+        by_staff = {}
+        staff_names = {}
+        staff_totals = {}
+        for r in rows:
+            sid = r["paid_by_id"]
+            staff_names[sid] = r["paid_by__name"]
+            by_staff.setdefault(sid, {})[r["day"]] = r
+            staff_totals[sid] = staff_totals.get(sid, Decimal("0.00")) + r["total_revenue"]
+
+        # เรียงตามยอดรวมมากไปน้อย เอา top (MAX_SERIES - 1) เป็นเส้นเดี่ยว ที่เหลือรวมเป็น "อื่นๆ"
+        ranked_ids = sorted(staff_totals, key=lambda sid: staff_totals[sid], reverse=True)
+        top_ids = ranked_ids[: self.MAX_SERIES - 1]
+        rest_ids = ranked_ids[self.MAX_SERIES - 1 :]
+
+        def build_days(day_map):
+            days = []
+            current = date_from
+            while current <= date_to:
+                r = day_map.get(current)
+                days.append(
+                    {
+                        "date": current.isoformat(),
+                        "total_revenue": str(r["total_revenue"]) if r else "0.00",
+                        "order_count": r["order_count"] if r else 0,
+                    }
+                )
+                current += timedelta(days=1)
+            return days
+
+        series = [
+            {"staff_id": str(sid), "staff_name": staff_names[sid], "days": build_days(by_staff[sid])}
+            for sid in top_ids
+        ]
+
+        if rest_ids:
+            merged = {}
+            for sid in rest_ids:
+                for day, r in by_staff[sid].items():
+                    m = merged.setdefault(day, {"total_revenue": Decimal("0.00"), "order_count": 0})
+                    m["total_revenue"] += r["total_revenue"]
+                    m["order_count"] += r["order_count"]
+            series.append({"staff_id": None, "staff_name": "อื่นๆ", "days": build_days(merged)})
+
+        return Response({"from": date_from.isoformat(), "to": date_to.isoformat(), "staff": series})
 
 
 class DiscountReportView(APIView):

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import { getStaffSession } from "@/lib/session";
 import { DateRangePicker, todayRange, type DateRange } from "@/components/DateRangePicker";
+import { DailyRevenueChart } from "@/components/DailyRevenueChart";
 
 interface StoreSales {
   store_id: string;
@@ -61,6 +62,8 @@ export default function SalesReportPage() {
       <DateRangePicker value={range} onChange={setRange} />
 
       {notice && <p className="text-sm text-rose-400">{notice}</p>}
+
+      <DailyRevenueChart from={range.from} to={range.to} />
 
       {data && (
         <>

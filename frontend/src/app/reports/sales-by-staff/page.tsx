@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import { getStaffSession } from "@/lib/session";
 import { DateRangePicker, todayRange, type DateRange } from "@/components/DateRangePicker";
+import { DailyRevenueByStaffChart } from "@/components/DailyRevenueByStaffChart";
 
 interface StaffRow {
   staff_id: string;
@@ -57,6 +58,9 @@ export default function SalesByStaffReportPage() {
       <DateRangePicker value={range} onChange={setRange} />
 
       {notice && <p className="text-sm text-rose-400">{notice}</p>}
+
+      <DailyRevenueByStaffChart from={range.from} to={range.to} />
+
       {data && data.staff.length === 0 && <p className="text-sm text-slate-500">ไม่มีข้อมูลในช่วงนี้</p>}
 
       {data && data.staff.length > 0 && (

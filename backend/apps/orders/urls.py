@@ -1,6 +1,8 @@
 from django.urls import path
 
 from .reports_views import (
+    DailySalesByStaffReportView,
+    DailySalesReportView,
     DiscountReportView,
     MenuPerformanceReportView,
     SalesByHourReportView,
@@ -32,9 +34,15 @@ urlpatterns = [
     path("summary/", OrderSummaryView.as_view(), name="order-summary"),
     path("today-sales/", OrderTodaySalesView.as_view(), name="order-today-sales"),
     path("reports/sales/", SalesReportView.as_view(), name="report-sales"),
+    path("reports/daily-sales/", DailySalesReportView.as_view(), name="report-daily-sales"),
     path("reports/menu-performance/", MenuPerformanceReportView.as_view(), name="report-menu-performance"),
     path("reports/sales-by-hour/", SalesByHourReportView.as_view(), name="report-sales-by-hour"),
     path("reports/sales-by-staff/", SalesByStaffReportView.as_view(), name="report-sales-by-staff"),
+    path(
+        "reports/daily-sales-by-staff/",
+        DailySalesByStaffReportView.as_view(),
+        name="report-daily-sales-by-staff",
+    ),
     path("reports/discounts/", DiscountReportView.as_view(), name="report-discounts"),
     path("reports/voids/", VoidReportView.as_view(), name="report-voids"),
     path("reports/tax/", TaxReportView.as_view(), name="report-tax"),

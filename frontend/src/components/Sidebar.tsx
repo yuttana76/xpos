@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { getStaffSession, clearStaffSession } from "@/lib/session";
+import { getStaffSession, clearStaffSession, type StaffSession } from "@/lib/session";
 
 const SIDEBAR_COLLAPSED_KEY = "xpos.sidebarCollapsed";
 
@@ -33,13 +33,21 @@ export function Sidebar() {
   const isReportSubPage = REPORT_LINKS.some((r) => r.href === pathname);
   const [reportsExpanded, setReportsExpanded] = useState(isReportSubPage);
   const [collapsed, setCollapsed] = useState(false);
-  const session = getStaffSession();
+  const [session, setSession] = useState<StaffSession | null>(null);
 
-  // อ่านค่าที่จำไว้หลัง mount เท่านั้น (ไม่ใช่ตอน render แรก) กัน hydration mismatch เพราะ server
-  // ไม่มี localStorage — ให้ทั้ง server กับ client render รอบแรกตรงกันเป็น collapsed=false ก่อนเสมอ
+  // อ่านค่าที่จำไว้หลัง mount เท่านั้น (ไม่ใช่ตอน render แรก) กัน hydration mismatch เพราะ server ไม่มี
+  // localStorage — ให้ทั้ง server กับ client render รอบแรกตรงกันเป็น false ก่อนเสมอ
   useEffect(() => {
     if (window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1") setCollapsed(true);
   }, []);
+
+  // อ่าน session ใหม่ทุกครั้งที่ pathname เปลี่ยน ไม่ใช่ mount ครั้งเดียว — Sidebar อยู่ใน root layout
+  // จึงไม่ unmount ตอน navigate ข้ามหน้า ถ้า deps เป็น [] เฉยๆ จะไม่รู้เลยว่า logout แล้ว login ใหม่
+  // ด้วย role อื่น (เมนูค้าง role เดิมทั้งที่ login ใหม่แล้วจริง) — logout/login เปลี่ยน pathname เสมอ
+  // (ไป /login แล้วกลับมา /floor) จึงใช้เป็นตัวกระตุ้นให้ re-check ได้พอดี โดยไม่ต้องทำ context แยก
+  useEffect(() => {
+    setSession(getStaffSession());
+  }, [pathname]);
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => {

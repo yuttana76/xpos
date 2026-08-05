@@ -7,7 +7,7 @@ import { db } from "@/lib/db";
 import { api } from "@/lib/api";
 import { nextReceiptNumber } from "@/lib/receipt";
 import { openTable } from "@/lib/orderActions";
-import { getDeviceConfig, getStaffSession } from "@/lib/session";
+import { getDeviceConfig, getStaffSession, type StaffSession } from "@/lib/session";
 import { elapsedMinutes } from "@/lib/time";
 import type { OrderRow } from "@/lib/db";
 
@@ -15,6 +15,15 @@ const KITCHEN_STATUS_LABEL: Record<string, string> = {
   PENDING: "รอส่งครัว",
   SENT: "ส่งครัวแล้ว",
   SERVED: "เสิร์ฟแล้ว",
+};
+
+const KITCHEN_STATUSES = ["PENDING", "SENT", "SERVED"] as const;
+type KitchenStatus = (typeof KITCHEN_STATUSES)[number];
+
+const KITCHEN_STATUS_DOT: Record<KitchenStatus, string> = {
+  PENDING: "bg-amber-400",
+  SENT: "bg-sky-400",
+  SERVED: "bg-emerald-400",
 };
 
 // นานเกิน 10 นาทีแล้วยังไม่ส่งครัว = ต้องรีบสังเกต เปลี่ยนจากเหลืองเป็นแดงเพื่อดึงความสนใจ
@@ -82,12 +91,28 @@ interface OrderSummary {
 
 export default function FloorPage() {
   const router = useRouter();
-  const [session, setSession] = useState(getStaffSession());
+  // เริ่มเป็น null เสมอทั้ง server/client แล้วค่อยอ่าน session จริงหลัง mount ใน useEffect ด้านล่าง —
+  // ไม่ใช่ useState(getStaffSession()) ตรงๆ เพราะ server ไม่มี localStorage แต่ client มี ทำให้ render
+  // แรกตอน hydrate ได้ค่าไม่ตรงกับ HTML ที่ server ส่งมา (React hydration mismatch) เหมือนบั๊กเดิมที่เจอ
+  // ใน Sidebar.tsx/StatusBar.tsx มาก่อนแล้ว (ดู spec-xpost.md §18 ข้อ 2)
+  const [session, setSession] = useState<StaffSession | null>(null);
   const [busyTableId, setBusyTableId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [openOrders, setOpenOrders] = useState<OpenOrder[]>([]);
   const [summary, setSummary] = useState<OrderSummary | null>(null);
   const [now, setNow] = useState(() => Date.now());
+
+  // default = ทุกสถานะ (พฤติกรรมเดิมก่อนมี filter) — เก็บเป็น Set กันการกดซ้ำเพี้ยน state
+  const [statusFilter, setStatusFilter] = useState<Set<KitchenStatus>>(new Set(KITCHEN_STATUSES));
+
+  const toggleStatusFilter = (status: KitchenStatus) => {
+    setStatusFilter((prev) => {
+      const next = new Set(prev);
+      if (next.has(status)) next.delete(status);
+      else next.add(status);
+      return next;
+    });
+  };
 
   const allZones = useLiveQuery(() => db.zones.filter((z) => z.is_active).toArray()) ?? [];
   const tables = useLiveQuery(() => db.dining_tables.filter((t) => t.is_active).toArray()) ?? [];
@@ -95,9 +120,19 @@ export default function FloorPage() {
   const menuItemName = (id: string) => menuItems.find((m) => m.id === id)?.name ?? id;
   const tableName = (id: string | null) => tables.find((t) => t.id === id)?.name ?? null;
 
+  // เช็คและ set session ใน effect เดียวกัน (ไม่แยกเป็น "populate" กับ "redirect ถ้าไม่มี" คนละ effect) —
+  // ถ้าแยกกัน ทั้งสอง effect จะ fire พร้อมกันในรอบ mount เดียวกันโดยเห็น session เป็น null เหมือนกันทั้งคู่
+  // (setState ใน effect แรกยังไม่ trigger re-render ทันที) ทำให้ effect หลัง redirect ไป /login ผิดพลาด
+  // ทั้งที่ล็อกอินค้างอยู่จริง — เจอบั๊กนี้ตอนแก้ hydration mismatch ด้านบน (เดิม session อ่านตรงๆ ไม่ผ่าน
+  // useEffect เลยไม่มีปัญหานี้)
   useEffect(() => {
-    if (!session) router.replace("/login");
-  }, [session, router]);
+    const s = getStaffSession();
+    if (!s) {
+      router.replace("/login");
+      return;
+    }
+    setSession(s);
+  }, [router]);
 
   useEffect(() => {
     if (!session) return;
@@ -188,12 +223,16 @@ export default function FloorPage() {
   };
 
   // แยกโซนแสดงผลตาม order type — โต๊ะกับ takeaway มีข้อมูลที่ต้องโชว์ต่างกัน (โต๊ะใช้ชื่อโต๊ะ, takeaway ใช้ชื่อ/เบอร์ลูกค้า)
-  const activeOrders = openOrders.filter((o) => o.items.length > 0);
+  // แสดงเฉพาะออเดอร์ที่มีอย่างน้อย 1 รายการตรงกับ status filter ที่เลือกไว้
+  const activeOrders = openOrders.filter((o) => o.items.some((i) => statusFilter.has(i.kitchen_status)));
   const dineInOrders = activeOrders.filter((o) => o.order_type !== "TAKEAWAY");
   const takeawayOrders = activeOrders.filter((o) => o.order_type === "TAKEAWAY");
 
   const renderOrderCard = (order: OpenOrder) => {
+    // badge "รอส่ง" นับจากรายการทั้งหมดของออเดอร์เสมอ ไม่ผูกกับ filter — เป็นข้อเท็จจริงของออเดอร์
+    // ส่วนรายการที่แสดงด้านล่างการ์ดถึงกรองตาม filter
     const pendingCount = order.items.filter((i) => i.kitchen_status === "PENDING").length;
+    const visibleItems = order.items.filter((i) => statusFilter.has(i.kitchen_status));
     return (
       <button
         key={order.id}
@@ -219,7 +258,7 @@ export default function FloorPage() {
           </div>
         )}
         <div className="divide-y divide-slate-800/60">
-          {order.items.map((item) => {
+          {visibleItems.map((item) => {
             const minutes = elapsedMinutes(item.updated_at, now);
             return (
               <div key={item.id} className="flex items-center justify-between gap-2 py-1.5">
@@ -264,16 +303,18 @@ export default function FloorPage() {
             {summary.date})
           </h2>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <button
-              onClick={() => router.push("/reports/today")}
-              className="text-left rounded-xl border border-slate-800 bg-slate-900/60 p-3 shadow-sm hover:border-slate-700 hover:bg-slate-800/60 transition-colors"
-            >
-              <p className="text-xs text-slate-400">รายรับวันนี้</p>
-              <p className="text-xl font-semibold text-emerald-400">฿{summary.total_revenue}</p>
-              <p className="text-[11px] text-slate-500">
-                เงินสด ฿{summary.cash_revenue} · QR ฿{summary.qr_revenue}
-              </p>
-            </button>
+            {session?.staff.role === "OWNER" && (
+              <button
+                onClick={() => router.push("/reports/today")}
+                className="text-left rounded-xl border border-slate-800 bg-slate-900/60 p-3 shadow-sm hover:border-slate-700 hover:bg-slate-800/60 transition-colors"
+              >
+                <p className="text-xs text-slate-400">รายรับวันนี้</p>
+                <p className="text-xl font-semibold text-emerald-400">฿{summary.total_revenue}</p>
+                <p className="text-[11px] text-slate-500">
+                  เงินสด ฿{summary.cash_revenue} · QR ฿{summary.qr_revenue}
+                </p>
+              </button>
+            )}
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3 shadow-sm">
               <p className="text-xs text-slate-400">บิลที่ชำระแล้ว</p>
               <p className="text-xl font-semibold">{summary.paid_order_count}</p>
@@ -296,7 +337,7 @@ export default function FloorPage() {
             </div>
           </div>
 
-          {(session?.staff.role === "OWNER" || session?.staff.role === "MANAGER") && (
+          {session?.staff.role === "OWNER" && (
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3 shadow-sm sm:w-64">
               <p className="text-xs text-slate-400">รายรับเดือนนี้</p>
               <p className="text-xl font-semibold text-emerald-400">฿{summary.monthly_revenue}</p>
@@ -304,7 +345,7 @@ export default function FloorPage() {
             </div>
           )}
 
-          {summary.by_store.length > 1 && (
+          {session?.staff.role === "OWNER" && summary.by_store.length > 1 && (
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3 shadow-sm overflow-x-auto">
               <p className="text-xs text-slate-400 mb-2">แยกตามร้าน</p>
               <table className="w-full text-sm">
@@ -364,23 +405,38 @@ export default function FloorPage() {
       ))}
 
       <div className="space-y-5">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-2">
           <h2 className="text-sm font-medium text-slate-300">สถานะรายการอาหารตามโต๊ะ</h2>
-          <div className="flex items-center gap-3 text-[11px] text-slate-500">
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-amber-400" /> รอส่งครัว
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-sky-400" /> ส่งครัวแล้ว
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-emerald-400" /> เสิร์ฟแล้ว
-            </span>
+          <div className="flex items-center gap-1.5">
+            {KITCHEN_STATUSES.map((status) => {
+              const active = statusFilter.has(status);
+              return (
+                <button
+                  key={status}
+                  onClick={() => toggleStatusFilter(status)}
+                  aria-pressed={active}
+                  className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors ${
+                    active
+                      ? "border-slate-700 bg-slate-800 text-slate-200"
+                      : "border-slate-800 bg-transparent text-slate-600 hover:text-slate-400"
+                  }`}
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${KITCHEN_STATUS_DOT[status]} ${active ? "" : "opacity-40"}`}
+                  />
+                  {KITCHEN_STATUS_LABEL[status]}
+                </button>
+              );
+            })}
           </div>
         </div>
 
         {activeOrders.length === 0 && (
-          <p className="text-sm text-slate-500">ไม่มีรายการที่กำลังดำเนินการอยู่</p>
+          <p className="text-sm text-slate-500">
+            {statusFilter.size === 0
+              ? "ยังไม่ได้เลือกสถานะที่จะแสดง — กดเลือกสถานะด้านบน"
+              : "ไม่มีรายการที่ตรงกับตัวกรองที่เลือกอยู่"}
+          </p>
         )}
 
         {dineInOrders.length > 0 && (

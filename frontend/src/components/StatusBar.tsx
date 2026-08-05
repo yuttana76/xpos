@@ -1,15 +1,26 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
-import { getStaffSession } from "@/lib/session";
+import { getStaffSession, type StaffSession } from "@/lib/session";
 import { useSyncStatus } from "./SyncProvider";
 
 const HIDDEN_ROUTES = new Set(["/", "/login"]);
 
 export function StatusBar() {
   const pathname = usePathname();
-  const session = getStaffSession();
+  const [session, setSession] = useState<StaffSession | null>(null);
   const { isOnline, isSyncing, pendingCount, syncNow } = useSyncStatus();
+
+  // อ่าน session หลัง mount เท่านั้น กัน hydration mismatch เพราะ server ไม่มี localStorage
+  // (ให้ server กับ client render รอบแรกตรงกันเป็น null ก่อนเสมอ — เดิมอ่านตรงๆ ตอน render ทำให้
+  // full page load ขณะ login ค้างอยู่ hydration mismatch ทุกครั้ง, เหมือนปัญหาเดียวกับ Sidebar)
+  // deps เป็น [pathname] ไม่ใช่ [] — component นี้อยู่ใน root layout ไม่ unmount ตอน navigate จึงต้อง
+  // re-check ทุกครั้งที่เปลี่ยนหน้า ไม่งั้น logout แล้ว login ใหม่ด้วย role อื่นจะยังอ่าน session เก่าค้างอยู่
+  // (เจอบั๊กนี้จริงใน Sidebar.tsx ตัวเมนูไม่เปลี่ยนตาม role ใหม่ — ปัญหาเดียวกันแฝงอยู่ที่นี่ด้วย)
+  useEffect(() => {
+    setSession(getStaffSession());
+  }, [pathname]);
 
   // แถบ sync/online นี้เป็น chrome เฉพาะตอนพนักงานใช้งานแอปอยู่ — ซ่อนบนหน้าสาธารณะ (landing/login/
   // self-order) เหมือน Sidebar (component เดียวกัน, กฎเดียวกัน — ดู HIDDEN_ROUTES ใน Sidebar.tsx)
